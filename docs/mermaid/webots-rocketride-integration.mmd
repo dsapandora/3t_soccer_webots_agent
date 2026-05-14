@@ -1,0 +1,18 @@
+%% End-to-end integration — dark / cyan poster + Webots banner (export to PNG)
+%% Placeholder __BANNER_FILE_URL__ replaced by render-integration-png.sh (file:// absolute URI)
+flowchart LR
+  subgraph SIM["Webots"]
+    IMG["<img src='__BANNER_FILE_URL__' width='300'/><br/>soccerv3.py · vision · native · fsm"]
+  end
+  subgraph HUB["Localhost hub"]
+    BR["agent_bridge.py<br/>RocketRide SDK async"]
+    BUS["mcp_server.BUS<br/>+ optional HTTP"]
+    BR --> BUS
+  end
+  subgraph SRV["RocketRide server"]
+    P["strategy.pipe<br/>chat_1 · agent_rocketride · llm_anthropic<br/>memory_internal · 12× tool_* · response_answers"]
+  end
+  IMG -->|world snapshot| BR
+  BR <-->|WebSocket chat| P
+  BR -->|BUS.post plan JSON| BUS
+  BUS -->|motor queue drain| IMG

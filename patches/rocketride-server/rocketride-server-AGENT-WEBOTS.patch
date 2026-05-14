@@ -1,0 +1,3946 @@
+diff --git a/nodes/src/nodes/agent_rocketride/IGlobal.py b/nodes/src/nodes/agent_rocketride/IGlobal.py
+index 212d6339..a3876b8d 100644
+--- a/nodes/src/nodes/agent_rocketride/IGlobal.py
++++ b/nodes/src/nodes/agent_rocketride/IGlobal.py
+@@ -14,9 +14,10 @@ stateless across runs and safe to share.
+ 
+ from __future__ import annotations
+ 
++import os
+ from typing import Any
+ 
+-from rocketlib import IGlobalBase
++from rocketlib import IGlobalBase, OPEN_MODE
+ 
+ 
+ class IGlobal(IGlobalBase):
+@@ -41,6 +42,14 @@ class IGlobal(IGlobalBase):
+         ``AgentBase.__init__`` via ``Config.getNodeConfig``, so no
+         config handling is needed here.
+         """
++        if self.IEndpoint.endpoint.openMode == OPEN_MODE.CONFIG:
++            return
++
++        from depends import depends
++
++        requirements = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'requirements.txt')
++        depends(requirements)
++
+         from .rocketride_agent import RocketRideDriver
+ 
+         self.agent = RocketRideDriver(self)
+diff --git a/nodes/src/nodes/agent_rocketride/IInstance.py b/nodes/src/nodes/agent_rocketride/IInstance.py
+index 7893dc18..ca4e2c28 100644
+--- a/nodes/src/nodes/agent_rocketride/IInstance.py
++++ b/nodes/src/nodes/agent_rocketride/IInstance.py
+@@ -30,7 +30,39 @@ class IInstance(IInstanceBase):
+ 
+     def writeQuestions(self, question: Question) -> None:
+         """Entry point for the questions lane — runs the wave agent loop."""
+-        self.IGlobal.agent.run_agent(self, question, emit_answers_lane=True)
++        # === DEBUG audit: dump question details + run_agent return value ===
++        def _audit(event, **kw):
++            try:
++                import json as _j, time as _t
++                with open('/tmp/rocketride_debug.log', 'a') as _f:
++                    _f.write(_j.dumps({'t': _t.strftime('%H:%M:%S.%f')[:-3],
++                                       'src': 'agent_writeQuestions',
++                                       'event': event, **kw},
++                                      default=str) + '\n')
++            except Exception:
++                pass
++        # Dump the actual question content fields
++        try:
++            qs = getattr(question, 'questions', None)
++            qtype = str(getattr(question, 'type', None))
++            ctx = getattr(question, 'context', None)
++            _audit('received',
++                   has_agent=self.IGlobal.agent is not None,
++                   q_type=qtype,
++                   q_questions=str(qs)[:400] if qs is not None else None,
++                   q_context=str(ctx)[:200] if ctx else None,
++                   q_full=str(question)[:600])
++        except Exception as exc:
++            _audit('received_dump_failed', exc=str(exc))
++        try:
++            ret = self.IGlobal.agent.run_agent(self, question, emit_answers_lane=True)
++            _audit('run_agent OK', ret_type=type(ret).__name__,
++                   ret_preview=str(ret)[:200])
++        except Exception as exc:
++            import traceback
++            _audit('run_agent FAIL', exc=str(exc),
++                   tb=traceback.format_exc()[:600])
++            raise
+ 
+     @tool_function(
+         input_schema=AGENT_TOOL_INPUT_SCHEMA,
+diff --git a/nodes/src/nodes/agent_rocketride/rocketride_agent.py b/nodes/src/nodes/agent_rocketride/rocketride_agent.py
+index a135f735..ccf03e2b 100644
+--- a/nodes/src/nodes/agent_rocketride/rocketride_agent.py
++++ b/nodes/src/nodes/agent_rocketride/rocketride_agent.py
+@@ -97,6 +97,25 @@ class RocketRideDriver(AgentBase):
+         """
+         run_id = context.run_id
+         debug(f'rocketride wave _run start run_id={run_id}')
++
++        # === Centralized debug log → /tmp/rocketride_debug.log ===
++        def _audit(event, **kw):
++            try:
++                import json as _j, time as _t
++                with open('/tmp/rocketride_debug.log', 'a') as _f:
++                    _f.write(_j.dumps({'t': _t.strftime('%H:%M:%S.%f')[:-3],
++                                       'src': 'agent', 'event': event, **kw},
++                                      default=str) + '\n')
++            except Exception:
++                pass
++        self._audit = _audit
++        try:
++            _tools = [t.get('name') for t in context.tools.list]
++        except Exception as _e:
++            _tools = [f'<error: {_e}>']
++        _audit('_run START', run_id=str(run_id), max_waves=self._max_waves,
++               question=str(question)[:200], tool_count=len(_tools), tools=_tools)
++
+         self.sendSSE(context, 'thinking', message='Analyzing your request...')
+ 
+         # waves accumulates the full history of every tool call and its result
+@@ -130,7 +149,13 @@ class RocketRideDriver(AgentBase):
+                     instructions=self._instructions,
+                     current_scratch=current_scratch,
+                 )
++                self._audit('plan_wave OK', wave=wave_num,
++                            done=result.get('done'),
++                            answer=str(result.get('answer', ''))[:120],
++                            tool_calls=[c.get('tool') for c in (result.get('tool_calls') or [])],
++                            instructions_count=len(self._instructions or []))
+             except Exception as exc:
++                self._audit('plan_wave FAIL', wave=wave_num, exc=str(exc))
+                 error(f'rocketride wave plan failed run_id={run_id}: {exc}')
+                 return f'LLM error: {exc}', trace
+ 
+@@ -184,6 +209,7 @@ class RocketRideDriver(AgentBase):
+                 # string — all without the LLM ever having seen the raw data.
+                 answer = resolve_answer_refs(answer, agent_base=self, context=context)
+                 debug(f'rocketride wave done wave_num={wave_num} run_id={run_id}')
++                self._audit('_run RETURN done', wave=wave_num, answer=str(answer)[:200])
+                 return answer, trace
+ 
+             # ------------------------------------------------------------------
+@@ -196,6 +222,8 @@ class RocketRideDriver(AgentBase):
+             tool_calls = result.get('tool_calls') or []
+             if not isinstance(tool_calls, list) or not tool_calls:
+                 debug(f'rocketride wave empty plan wave_num={wave_num} run_id={run_id}, stopping')
++                self._audit('_run BREAK empty_plan', wave=wave_num,
++                            result_keys=list(result.keys()))
+                 break
+ 
+             # Inform the UI which tools are about to run this wave
+diff --git a/nodes/src/nodes/gpt_image_edit/IGlobal.py b/nodes/src/nodes/gpt_image_edit/IGlobal.py
+new file mode 100644
+index 00000000..45daa48d
+--- /dev/null
++++ b/nodes/src/nodes/gpt_image_edit/IGlobal.py
+@@ -0,0 +1,62 @@
++# =============================================================================
++# RocketRide Engine
++# =============================================================================
++# MIT License
++# Copyright (c) 2026 Aparavi Software AG
++# =============================================================================
++
++"""GPT Image Edit - shared client and per-pipeline defaults.
++
++Per-record values (frame_b64, ref_b64s, prompt) arrive on the text lane in a
++JSON payload — they are NOT in this config.
++"""
++
++from __future__ import annotations
++
++from ai.common.config import Config
++from rocketlib import IGlobalBase, OPEN_MODE, warning
++
++from openai import OpenAI
++
++
++class IGlobal(IGlobalBase):
++    client: OpenAI | None = None
++    model: str = 'gpt-5.5'
++    image_model: str = 'gpt-image-2'
++    default_quality: str = 'low'
++    default_size: str = '1024x1024'
++    moderation: str = 'auto'
++
++    def beginGlobal(self) -> None:
++        if self.IEndpoint.endpoint.openMode == OPEN_MODE.CONFIG:
++            return
++
++        cfg = Config.getNodeConfig(self.glb.logicalType, self.glb.connConfig)
++        apikey = str((cfg.get('apikey') or '')).strip()
++
++        if not apikey:
++            raise Exception('gpt_image_edit: apikey is required')
++
++        self.model = str(cfg.get('model') or 'gpt-5.5').strip()
++        self.image_model = str(cfg.get('imageModel') or 'gpt-image-2').strip()
++        self.default_quality = str(cfg.get('quality') or 'low').strip()
++        self.default_size = str(cfg.get('size') or '1024x1024').strip()
++        self.moderation = str(cfg.get('moderation') or 'auto').strip()
++
++        try:
++            self.client = OpenAI(api_key=apikey)
++        except Exception as e:
++            warning(str(e))
++            raise
++
++    def validateConfig(self) -> None:
++        try:
++            cfg = Config.getNodeConfig(self.glb.logicalType, self.glb.connConfig)
++            apikey = str((cfg.get('apikey') or '')).strip()
++            if not apikey:
++                warning('apikey is required')
++        except Exception as e:
++            warning(str(e))
++
++    def endGlobal(self) -> None:
++        self.client = None
+diff --git a/nodes/src/nodes/gpt_image_edit/IInstance.py b/nodes/src/nodes/gpt_image_edit/IInstance.py
+new file mode 100644
+index 00000000..210026bf
+--- /dev/null
++++ b/nodes/src/nodes/gpt_image_edit/IInstance.py
+@@ -0,0 +1,153 @@
++# =============================================================================
++# RocketRide Engine
++# =============================================================================
++# MIT License
++# Copyright (c) 2026 Aparavi Software AG
++# =============================================================================
++
++"""GPT Image Edit instance.
++
++Receives a JSON record on the text lane. The record can be in either of two
++shapes:
++
++  A) Pre-uploaded mode:
++     {"frame_id": "file-XXX", "ref_ids": ["file-AAA", ...], "prompt": "..."}
++
++  B) Base64 mode (requires an uploader connected via control plane):
++     {"frame_b64": "<base64>", "ref_b64s": ["<base64>", ...], "prompt": "..."}
++
++If the record arrives in shape B, the editor invokes the optional uploader
++resource (declared in services.json as ``invoke: {uploader: {...}}``) to
++transform _b64 / _b64s keys into _id / _ids. If no uploader is connected and
++shape B is received, the record fails with a clear warning.
++
++The Responses API ``image_generation`` tool is then called with the resulting
++file_ids and the edited PNG is emitted on the image lane.
++"""
++
++from __future__ import annotations
++
++import base64
++import json
++
++from rocketlib import AVI_ACTION, IInstanceBase, debug, warning
++
++from .IGlobal import IGlobal
++
++try:
++    from nodes.openai_files_upload.invoke_types import IInvokeUploader
++except Exception:  # pragma: no cover — uploader package optional
++    IInvokeUploader = None  # type: ignore[assignment]
++
++
++class IInstance(IInstanceBase):
++    IGlobal: IGlobal
++
++    def writeText(self, text: str):
++        client = self.IGlobal.client
++        if client is None:
++            warning('gpt_image_edit: OpenAI client not initialized')
++            return self.preventDefault()
++
++        body = (text or '').strip()
++        if not body:
++            warning('gpt_image_edit: empty record')
++            return self.preventDefault()
++
++        try:
++            payload = json.loads(body)
++        except (json.JSONDecodeError, TypeError) as e:
++            warning(f'gpt_image_edit: record is not valid JSON: {e}')
++            return self.preventDefault()
++
++        if not isinstance(payload, dict):
++            warning('gpt_image_edit: payload must be a JSON object')
++            return self.preventDefault()
++
++        # If the record carries base64 keys, ask the connected uploader to
++        # transform them into file_ids first.
++        if any(k.endswith('_b64') or k.endswith('_b64s') for k in payload):
++            if IInvokeUploader is None:
++                warning('gpt_image_edit: record has _b64 keys but IInvokeUploader is not importable')
++                return self.preventDefault()
++            try:
++                debug('gpt_image_edit: record has base64 keys, invoking uploader...')
++                payload = self.instance.invoke(IInvokeUploader.Upload(payload=payload))
++            except Exception as e:
++                warning(f'gpt_image_edit: uploader invoke failed: {e!r}. Connect an openai_files_upload node to gpt_image_edit_1 with control: [{{"classType": "uploader", "from": "<editor_id>"}}], or send file_ids directly.')
++                return self.preventDefault()
++            if not isinstance(payload, dict):
++                warning(f'gpt_image_edit: uploader returned non-dict ({type(payload).__name__})')
++                return self.preventDefault()
++
++        frame_id = payload.get('frame_id')
++        ref_ids = payload.get('ref_ids') or []
++        prompt = payload.get('prompt')
++
++        if not isinstance(frame_id, str) or not frame_id:
++            warning('gpt_image_edit: missing/invalid frame_id after upload step')
++            return self.preventDefault()
++        if not isinstance(ref_ids, list) or not ref_ids or not all(isinstance(r, str) and r for r in ref_ids):
++            warning('gpt_image_edit: ref_ids must be a non-empty list of file_id strings')
++            return self.preventDefault()
++        if len(ref_ids) > 4:
++            warning('gpt_image_edit: at most 4 reference images supported; truncating')
++            ref_ids = ref_ids[:4]
++        if not isinstance(prompt, str) or not prompt:
++            warning('gpt_image_edit: missing/invalid prompt')
++            return self.preventDefault()
++
++        quality = (payload.get('quality') or self.IGlobal.default_quality or 'low').strip()
++        size = (payload.get('size') or self.IGlobal.default_size or '1024x1024').strip()
++
++        debug(f'gpt_image_edit: editing frame_id={frame_id} refs={len(ref_ids)} quality={quality} size={size} model={self.IGlobal.model}')
++
++        content = [{'type': 'input_text', 'text': prompt}]
++        content.append({'type': 'input_image', 'file_id': frame_id})
++        for rid in ref_ids:
++            content.append({'type': 'input_image', 'file_id': rid})
++
++        image_tool = {
++            'type': 'image_generation',
++            'quality': quality,
++            'moderation': self.IGlobal.moderation,
++        }
++        if self.IGlobal.image_model:
++            image_tool['model'] = self.IGlobal.image_model
++        if size and size != 'auto':
++            image_tool['size'] = size
++
++        try:
++            response = client.responses.create(
++                model=self.IGlobal.model,
++                input=[{'role': 'user', 'content': content}],
++                tools=[image_tool],
++            )
++            debug(f'gpt_image_edit: responses.create returned id={getattr(response, "id", "?")}')
++        except Exception as e:
++            warning(f'gpt_image_edit: responses.create failed: {e!r}')
++            return self.preventDefault()
++
++        results = [
++            output.result
++            for output in getattr(response, 'output', []) or []
++            if getattr(output, 'type', None) == 'image_generation_call' and getattr(output, 'result', None)
++        ]
++        if not results:
++            warning('gpt_image_edit: no image_generation_call result in response')
++            return self.preventDefault()
++
++        try:
++            png_bytes = base64.b64decode(results[0])
++        except Exception as e:
++            warning(f'gpt_image_edit: failed to decode base64 result: {e!r}')
++            return self.preventDefault()
++
++        mime = 'image/png'
++        debug(f'gpt_image_edit: emitting image bytes={len(png_bytes)}')
++        self.instance.writeImage(AVI_ACTION.BEGIN, mime)
++        self.instance.writeImage(AVI_ACTION.WRITE, mime, png_bytes)
++        self.instance.writeImage(AVI_ACTION.END, mime)
++        debug('gpt_image_edit: emit complete')
++
++        return self.preventDefault()
+diff --git a/nodes/src/nodes/gpt_image_edit/README.md b/nodes/src/nodes/gpt_image_edit/README.md
+new file mode 100644
+index 00000000..bf3234c8
+--- /dev/null
++++ b/nodes/src/nodes/gpt_image_edit/README.md
+@@ -0,0 +1,51 @@
++# gpt_image_edit
++
++## What it does
++
++Edits an image using OpenAI's image generation via the Responses API (`gpt-image-1` under the hood). Each record on the input lane is a self-contained JSON document carrying the frame, the references and the prompt — no per-pipeline configuration of refs is needed.
++
++## Lanes
++
++| Input  | Output  |
++| ------ | ------- |
++| `text` | `image` |
++
++## Per-record JSON
++
++```json
++{
++  "frame_b64": "<base64 PNG>",
++  "ref_b64s": ["<base64 PNG>", "<base64 PNG>"],
++  "prompt": "Replace the person with the reference character...",
++  "quality": "low",          // optional, overrides node default
++  "size": "1024x1024"        // optional, overrides node default
++}
++```
++
++- `frame_b64` (required): base64-encoded image to edit.
++- `ref_b64s` (required): 1–4 base64-encoded reference images.
++- `prompt` (required): editing instructions.
++- `quality`, `size`: optional per-record overrides.
++
++The node uploads `frame_b64` and every entry of `ref_b64s` to the OpenAI Files API (`purpose=vision`) on every record, then calls the Responses API `image_generation` tool with the resulting file_ids.
++
++## Configuration
++
++| Field        | Required | Description                                  |
++| ------------ | -------- | -------------------------------------------- |
++| `apikey`     | yes      | OpenAI API key.                              |
++| `model`      | no       | Responses model (default `gpt-5.5`).         |
++| `quality`    | no       | Default rendering quality (record overrides).|
++| `size`       | no       | Default output resolution (record overrides).|
++| `moderation` | no       | `auto` (default) or `low`.                   |
++
++## Example pipeline
++
++```text
++webhook → text → gpt_image_edit → image → response_image
++```
++
++## Upstream docs
++
++- https://developers.openai.com/api/docs/guides/image-generation
++- https://developers.openai.com/api/docs/api-reference/files
+diff --git a/nodes/src/nodes/gpt_image_edit/__init__.py b/nodes/src/nodes/gpt_image_edit/__init__.py
+new file mode 100644
+index 00000000..b1e53a2b
+--- /dev/null
++++ b/nodes/src/nodes/gpt_image_edit/__init__.py
+@@ -0,0 +1,17 @@
++# =============================================================================
++# RocketRide Engine
++# =============================================================================
++# MIT License
++# Copyright (c) 2026 Aparavi Software AG
++# =============================================================================
++
++from os.path import dirname, join, realpath
++from depends import depends
++
++requirements = join(dirname(realpath(__file__)), 'requirements.txt')
++depends(requirements)
++
++from .IGlobal import IGlobal
++from .IInstance import IInstance
++
++__all__ = ['IGlobal', 'IInstance']
+diff --git a/nodes/src/nodes/gpt_image_edit/requirements.txt b/nodes/src/nodes/gpt_image_edit/requirements.txt
+new file mode 100644
+index 00000000..60b41c85
+--- /dev/null
++++ b/nodes/src/nodes/gpt_image_edit/requirements.txt
+@@ -0,0 +1 @@
++openai>=1.50.0
+diff --git a/nodes/src/nodes/gpt_image_edit/services.json b/nodes/src/nodes/gpt_image_edit/services.json
+new file mode 100644
+index 00000000..d4cf7300
+--- /dev/null
++++ b/nodes/src/nodes/gpt_image_edit/services.json
+@@ -0,0 +1,122 @@
++{
++	"title": "GPT Image Edit",
++	"protocol": "gpt_image_edit://",
++	"classType": ["image"],
++	"capabilities": [],
++	"register": "filter",
++	"node": "python",
++	"path": "nodes.gpt_image_edit",
++	"prefix": "gpt_image_edit",
++	"icon": "openai.svg",
++	"documentation": "https://docs.rocketride.org",
++	"description": [
++		"Edits an image using OpenAI's image generation via the Responses API.",
++		"Per-record input is a JSON document on the text lane. The record may carry either base64 image data (frame_b64, ref_b64s) or pre-uploaded OpenAI file_ids (frame_id, ref_ids). When base64 is present, an optional connected uploader (openai_files_upload via control plane) is invoked to convert to file_ids before editing."
++	],
++	"tile": ["Model: ${parameters.gpt_image_edit.model}"],
++	"invoke": {
++		"uploader": {
++			"description": "Optional file uploader. If connected and the input record carries _b64 / _b64s keys, the editor invokes this uploader to obtain file_ids before calling the Responses API.",
++			"min": 0,
++			"max": 1
++		}
++	},
++	"lanes": {
++		"text": ["image"]
++	},
++	"input": [
++		{
++			"lane": "text",
++			"description": "JSON record. Either {frame_b64, ref_b64s, prompt} (uploader required) or {frame_id, ref_ids, prompt} (no uploader needed).",
++			"output": [
++				{ "lane": "image", "description": "Edited PNG image." }
++			]
++		}
++	],
++	"preconfig": {
++		"default": "default",
++		"profiles": {
++			"default": {
++				"title": "GPT Image Edit",
++				"apikey": "",
++				"model": "gpt-5.5",
++				"imageModel": "gpt-image-2",
++				"quality": "low",
++				"size": "1024x1024",
++				"moderation": "auto"
++			}
++		}
++	},
++	"fields": {
++		"gpt_image_edit.apikey": {
++			"type": "string",
++			"title": "API Key",
++			"description": "OpenAI API key.",
++			"default": "",
++			"secure": true,
++			"ui": {
++				"ui:widget": "ApiKeyWidget"
++			}
++		},
++		"gpt_image_edit.model": {
++			"type": "string",
++			"title": "Responses Model",
++			"description": "OpenAI Responses model used to invoke the image_generation tool.",
++			"default": "gpt-5.5"
++		},
++		"gpt_image_edit.imageModel": {
++			"type": "string",
++			"title": "Image Generation Model",
++			"description": "Underlying GPT Image model used by the image_generation tool. Leave empty to let OpenAI pick the default (typically gpt-image-1).",
++			"default": "gpt-image-2",
++			"enum": [
++				["gpt-image-2", "GPT Image 2 (newer)"],
++				["gpt-image-1.5", "GPT Image 1.5"],
++				["gpt-image-1", "GPT Image 1"],
++				["gpt-image-1-mini", "GPT Image 1 Mini"]
++			]
++		},
++		"gpt_image_edit.quality": {
++			"type": "string",
++			"title": "Quality",
++			"description": "Default rendering quality (per-record JSON can override).",
++			"default": "low",
++			"enum": [
++				["low", "Low (fastest, cheapest)"],
++				["medium", "Medium"],
++				["high", "High"],
++				["auto", "Auto"]
++			]
++		},
++		"gpt_image_edit.size": {
++			"type": "string",
++			"title": "Size",
++			"description": "Default output resolution (per-record JSON can override).",
++			"default": "1024x1024"
++		},
++		"gpt_image_edit.moderation": {
++			"type": "string",
++			"title": "Moderation",
++			"description": "Content moderation strictness.",
++			"default": "auto",
++			"enum": [
++				["auto", "Auto"],
++				["low", "Low"]
++			]
++		}
++	},
++	"shape": [
++		{
++			"section": "Pipe",
++			"title": "GPT Image Edit",
++			"properties": [
++				"gpt_image_edit.apikey",
++				"gpt_image_edit.model",
++				"gpt_image_edit.imageModel",
++				"gpt_image_edit.quality",
++				"gpt_image_edit.size",
++				"gpt_image_edit.moderation"
++			]
++		}
++	]
++}
+diff --git a/nodes/src/nodes/openai_files_upload/IGlobal.py b/nodes/src/nodes/openai_files_upload/IGlobal.py
+new file mode 100644
+index 00000000..c65802be
+--- /dev/null
++++ b/nodes/src/nodes/openai_files_upload/IGlobal.py
+@@ -0,0 +1,50 @@
++# =============================================================================
++# RocketRide Engine
++# =============================================================================
++# MIT License
++# Copyright (c) 2026 Aparavi Software AG
++# =============================================================================
++
++"""OpenAI Files Upload - shared client and config."""
++
++from __future__ import annotations
++
++from ai.common.config import Config
++from rocketlib import IGlobalBase, OPEN_MODE, warning
++
++from openai import OpenAI
++
++
++class IGlobal(IGlobalBase):
++    client: OpenAI | None = None
++    purpose: str = 'vision'
++
++    def beginGlobal(self) -> None:
++        if self.IEndpoint.endpoint.openMode == OPEN_MODE.CONFIG:
++            return
++
++        cfg = Config.getNodeConfig(self.glb.logicalType, self.glb.connConfig)
++        apikey = str((cfg.get('apikey') or '')).strip()
++
++        if not apikey:
++            raise Exception('openai_files_upload: apikey is required')
++
++        self.purpose = str(cfg.get('purpose') or 'vision').strip()
++
++        try:
++            self.client = OpenAI(api_key=apikey)
++        except Exception as e:
++            warning(str(e))
++            raise
++
++    def validateConfig(self) -> None:
++        try:
++            cfg = Config.getNodeConfig(self.glb.logicalType, self.glb.connConfig)
++            apikey = str((cfg.get('apikey') or '')).strip()
++            if not apikey:
++                warning('apikey is required')
++        except Exception as e:
++            warning(str(e))
++
++    def endGlobal(self) -> None:
++        self.client = None
+diff --git a/nodes/src/nodes/openai_files_upload/IInstance.py b/nodes/src/nodes/openai_files_upload/IInstance.py
+new file mode 100644
+index 00000000..2fe53d4f
+--- /dev/null
++++ b/nodes/src/nodes/openai_files_upload/IInstance.py
+@@ -0,0 +1,205 @@
++# =============================================================================
++# RocketRide Engine
++# =============================================================================
++# MIT License
++# Copyright (c) 2026 Aparavi Software AG
++# =============================================================================
++
++"""OpenAI Files Upload instance.
++
++Two operating modes:
++
++1. Image lane in (raw bytes):
++     Buffers the incoming image, uploads it to the OpenAI Files API and emits
++     the resulting file_id as a single line on the ``text`` lane. Suitable for
++     pipelines where image data already flows through the image lane.
++
++2. Text lane in (JSON object):
++     For each key in the JSON whose name ends in ``_b64`` (single base64
++     image) or ``_b64s`` (array of base64 images), uploads the image(s) to
++     the Files API and rewrites the key to ``_id`` / ``_ids`` with the
++     resulting file_id(s). Other keys are forwarded untouched. Emits the new
++     JSON object on the ``text`` lane.
++
++This makes the node a generic "OpenAI base64 -> file_id" transformer that any
++downstream node can rely on (e.g. ``gpt_image_edit``).
++"""
++
++from __future__ import annotations
++
++import base64
++import io
++import json
++import mimetypes
++
++from rocketlib import AVI_ACTION, IInstanceBase, debug, invoke_function, warning
++
++from .IGlobal import IGlobal
++
++
++_MIME_EXT = {
++    'image/png': 'png',
++    'image/jpeg': 'jpg',
++    'image/webp': 'webp',
++    'image/gif': 'gif',
++}
++
++
++class IInstance(IInstanceBase):
++    IGlobal: IGlobal
++
++    def __init__(self):
++        super().__init__()
++        self.image_data: bytearray | None = None
++
++    # -- mode 1: image lane in -------------------------------------------------
++
++    def writeImage(self, action: int, mimeType: str, buffer: bytes):
++        if action == AVI_ACTION.BEGIN:
++            debug(f'openai_files_upload[image]: BEGIN mime={mimeType}')
++            self.image_data = bytearray()
++            return self.preventDefault()
++
++        if action == AVI_ACTION.WRITE:
++            if self.image_data is None:
++                self.image_data = bytearray()
++            if buffer:
++                self.image_data += buffer
++            return self.preventDefault()
++
++        if action == AVI_ACTION.END:
++            data = bytes(self.image_data) if self.image_data else b''
++            self.image_data = None
++            debug(f'openai_files_upload[image]: END mime={mimeType} bytes={len(data)}')
++
++            if not data:
++                warning('openai_files_upload[image]: empty image buffer; nothing to upload')
++                return self.preventDefault()
++
++            client = self.IGlobal.client
++            if client is None:
++                warning('openai_files_upload[image]: OpenAI client not initialized')
++                return self.preventDefault()
++
++            ext = _MIME_EXT.get((mimeType or '').lower())
++            if ext is None:
++                guessed = mimetypes.guess_extension(mimeType or '') or '.bin'
++                ext = guessed.lstrip('.') or 'bin'
++
++            buf = io.BytesIO(data)
++            buf.name = f'frame.{ext}'
++
++            try:
++                uploaded = client.files.create(file=buf, purpose=self.IGlobal.purpose)
++                debug(f'openai_files_upload[image]: uploaded id={uploaded.id}')
++            except Exception as e:
++                warning(f'openai_files_upload[image]: upload failed: {e!r}')
++                return self.preventDefault()
++
++            self.instance.writeText(uploaded.id)
++            return self.preventDefault()
++
++        return None
++
++    # -- mode 2: text lane in (JSON) ------------------------------------------
++
++    def writeText(self, text: str):
++        client = self.IGlobal.client
++        if client is None:
++            warning('openai_files_upload[json]: OpenAI client not initialized')
++            return self.preventDefault()
++
++        body = (text or '').strip()
++        if not body:
++            warning('openai_files_upload[json]: empty record')
++            return self.preventDefault()
++
++        try:
++            payload = json.loads(body)
++        except (json.JSONDecodeError, TypeError) as e:
++            warning(f'openai_files_upload[json]: record is not valid JSON: {e}')
++            return self.preventDefault()
++
++        if not isinstance(payload, dict):
++            warning('openai_files_upload[json]: payload must be a JSON object')
++            return self.preventDefault()
++
++        debug(f'openai_files_upload[json]: input keys={list(payload.keys())}')
++
++        out: dict = {}
++        try:
++            for key, value in payload.items():
++                if key.endswith('_b64s') and isinstance(value, list):
++                    new_key = key[:-len('_b64s')] + '_ids'
++                    file_ids = []
++                    for i, b64 in enumerate(value):
++                        if not isinstance(b64, str) or not b64:
++                            raise ValueError(f'{key}[{i}] is not a non-empty base64 string')
++                        file_ids.append(self._upload_b64(client, b64, name=f'{key}_{i}.png'))
++                    out[new_key] = file_ids
++                    debug(f'openai_files_upload[json]: {key} ({len(value)}) -> {new_key} ({len(file_ids)})')
++                elif key.endswith('_b64') and isinstance(value, str):
++                    new_key = key[:-len('_b64')] + '_id'
++                    out[new_key] = self._upload_b64(client, value, name=f'{key}.png')
++                    debug(f'openai_files_upload[json]: {key} -> {new_key}={out[new_key]}')
++                else:
++                    out[key] = value
++        except Exception as e:
++            warning(f'openai_files_upload[json]: upload failed: {e!r}')
++            return self.preventDefault()
++
++        result_json = json.dumps(out)
++        debug(f'openai_files_upload[json]: emitting keys={list(out.keys())}')
++        self.instance.writeText(result_json)
++        return self.preventDefault()
++
++    # -- mode 3: control plane (invoke) ---------------------------------------
++
++    @invoke_function
++    def upload(self, param):
++        """Invoke handler. Receives an IInvokeUploader.Upload op and transforms
++        the payload's _b64 / _b64s keys into _id / _ids using the Files API.
++        """
++        payload = getattr(param, 'payload', None)
++        if not isinstance(payload, dict):
++            warning('openai_files_upload[invoke]: payload must be a dict')
++            return {}
++
++        client = self.IGlobal.client
++        if client is None:
++            warning('openai_files_upload[invoke]: OpenAI client not initialized')
++            return {}
++
++        debug(f'openai_files_upload[invoke]: input keys={list(payload.keys())}')
++
++        out: dict = {}
++        try:
++            for key, value in payload.items():
++                if key.endswith('_b64s') and isinstance(value, list):
++                    new_key = key[:-len('_b64s')] + '_ids'
++                    file_ids = []
++                    for i, b64 in enumerate(value):
++                        if not isinstance(b64, str) or not b64:
++                            raise ValueError(f'{key}[{i}] is not a non-empty base64 string')
++                        file_ids.append(self._upload_b64(client, b64, name=f'{key}_{i}.png'))
++                    out[new_key] = file_ids
++                elif key.endswith('_b64') and isinstance(value, str):
++                    new_key = key[:-len('_b64')] + '_id'
++                    out[new_key] = self._upload_b64(client, value, name=f'{key}.png')
++                else:
++                    out[key] = value
++        except Exception as e:
++            warning(f'openai_files_upload[invoke]: upload failed: {e!r}')
++            raise
++
++        debug(f'openai_files_upload[invoke]: output keys={list(out.keys())}')
++        return out
++
++    # -- helper ----------------------------------------------------------------
++
++    def _upload_b64(self, client, b64: str, *, name: str) -> str:
++        data = base64.b64decode(b64)
++        buf = io.BytesIO(data)
++        buf.name = name
++        uploaded = client.files.create(file=buf, purpose=self.IGlobal.purpose)
++        return uploaded.id
+diff --git a/nodes/src/nodes/openai_files_upload/README.md b/nodes/src/nodes/openai_files_upload/README.md
+new file mode 100644
+index 00000000..c321bda2
+--- /dev/null
++++ b/nodes/src/nodes/openai_files_upload/README.md
+@@ -0,0 +1,26 @@
++# openai_files_upload
++
++## What it does
++
++Uploads each incoming image to the OpenAI Files API and emits the resulting `file_id` as text. Use this when downstream nodes need an OpenAI file reference instead of raw image bytes (e.g. the Responses API `image_generation` tool, vision inputs, batch jobs).
++
++## Lanes
++
++| Input   | Output |
++| ------- | ------ |
++| `image` | `text` |
++
++## Configuration
++
++| Field     | Required | Description                                     |
++| --------- | -------- | ----------------------------------------------- |
++| `apikey`  | yes      | OpenAI API key.                                 |
++| `purpose` | no       | Files API purpose (default `vision`).           |
++
++## Output
++
++A single text line per image: the OpenAI file_id (e.g. `file-Xz4JE...`).
++
++## Upstream docs
++
++- https://developers.openai.com/api/docs/api-reference/files
+diff --git a/nodes/src/nodes/openai_files_upload/__init__.py b/nodes/src/nodes/openai_files_upload/__init__.py
+new file mode 100644
+index 00000000..b1e53a2b
+--- /dev/null
++++ b/nodes/src/nodes/openai_files_upload/__init__.py
+@@ -0,0 +1,17 @@
++# =============================================================================
++# RocketRide Engine
++# =============================================================================
++# MIT License
++# Copyright (c) 2026 Aparavi Software AG
++# =============================================================================
++
++from os.path import dirname, join, realpath
++from depends import depends
++
++requirements = join(dirname(realpath(__file__)), 'requirements.txt')
++depends(requirements)
++
++from .IGlobal import IGlobal
++from .IInstance import IInstance
++
++__all__ = ['IGlobal', 'IInstance']
+diff --git a/nodes/src/nodes/openai_files_upload/invoke_types.py b/nodes/src/nodes/openai_files_upload/invoke_types.py
+new file mode 100644
+index 00000000..658cb552
+--- /dev/null
++++ b/nodes/src/nodes/openai_files_upload/invoke_types.py
+@@ -0,0 +1,43 @@
++# =============================================================================
++# RocketRide Engine
++# =============================================================================
++# MIT License
++# Copyright (c) 2026 Aparavi Software AG
++# =============================================================================
++
++"""Invoke type for openai_files_upload acting as a control-plane resource.
++
++A consumer (e.g. gpt_image_edit) declares ``invoke: {uploader: {min: 0, max: 1}}``
++in its services.json and calls::
++
++    result = self.instance.invoke(IInvokeUploader.Upload(payload={...}))
++
++The resolver routes the call to the instance of openai_files_upload that
++declares ``control: [{classType: "uploader", from: "<consumer_id>"}]``.
++
++The lane name ``"uploader"`` is the contract — both sides must agree.
++"""
++
++from __future__ import annotations
++
++from typing import Any
++
++from pydantic import Field
++
++from rocketlib import IInvoke, IInvokeOp
++
++
++class IInvokeUploader(IInvoke):
++    """Uploader namespace — construct via inner classes."""
++
++    class Upload(IInvokeOp):
++        """Transform a JSON object: ``*_b64`` -> ``*_id``, ``*_b64s`` -> ``*_ids``.
++
++        ``payload`` is the input JSON object (dict). The handler returns a new
++        dict with all base64 image values replaced by their OpenAI Files API
++        file_ids; non-image keys pass through untouched.
++        """
++
++        lane: str = 'uploader'
++        op: str = Field(default='upload', frozen=True)
++        payload: Any
+diff --git a/nodes/src/nodes/openai_files_upload/requirements.txt b/nodes/src/nodes/openai_files_upload/requirements.txt
+new file mode 100644
+index 00000000..60b41c85
+--- /dev/null
++++ b/nodes/src/nodes/openai_files_upload/requirements.txt
+@@ -0,0 +1 @@
++openai>=1.50.0
+diff --git a/nodes/src/nodes/openai_files_upload/services.json b/nodes/src/nodes/openai_files_upload/services.json
+new file mode 100644
+index 00000000..361a3679
+--- /dev/null
++++ b/nodes/src/nodes/openai_files_upload/services.json
+@@ -0,0 +1,83 @@
++{
++	"title": "OpenAI Files Upload",
++	"protocol": "openai_files_upload://",
++	"classType": ["image"],
++	"capabilities": ["invoke"],
++	"register": "filter",
++	"node": "python",
++	"path": "nodes.openai_files_upload",
++	"prefix": "openai_files_upload",
++	"icon": "openai.svg",
++	"documentation": "https://docs.rocketride.org",
++	"description": [
++		"Uploads images to the OpenAI Files API and replaces them with file_ids.",
++		"Three modes:",
++		"- image lane in: uploads the bytes; emits the file_id as text.",
++		"- text lane in (JSON): finds keys ending in _b64 or _b64s, uploads each value, and emits a JSON with the same shape using _id / _ids keys.",
++		"- control plane (uploader): consumed via IInvokeUploader.Upload(payload). The caller (e.g. gpt_image_edit) hands the JSON in; this node returns the transformed JSON."
++	],
++	"tile": ["Purpose: ${parameters.openai_files_upload.purpose}"],
++	"lanes": {
++		"image": ["text"],
++		"text": ["text"]
++	},
++	"input": [
++		{
++			"lane": "image",
++			"description": "Image bytes to upload (PNG, JPEG, WebP).",
++			"output": [
++				{ "lane": "text", "description": "OpenAI file_id of the uploaded image." }
++			]
++		},
++		{
++			"lane": "text",
++			"description": "JSON object whose *_b64 / *_b64s keys hold base64 image data.",
++			"output": [
++				{ "lane": "text", "description": "Same JSON with *_b64 -> *_id and *_b64s -> *_ids." }
++			]
++		}
++	],
++	"preconfig": {
++		"default": "default",
++		"profiles": {
++			"default": {
++				"title": "OpenAI Files Upload",
++				"apikey": "",
++				"purpose": "vision"
++			}
++		}
++	},
++	"fields": {
++		"openai_files_upload.apikey": {
++			"type": "string",
++			"title": "API Key",
++			"description": "OpenAI API key.",
++			"default": "",
++			"secure": true,
++			"ui": {
++				"ui:widget": "ApiKeyWidget"
++			}
++		},
++		"openai_files_upload.purpose": {
++			"type": "string",
++			"title": "Purpose",
++			"description": "Files API purpose tag (default vision).",
++			"default": "vision",
++			"enum": [
++				["vision", "vision"],
++				["assistants", "assistants"],
++				["batch", "batch"]
++			]
++		}
++	},
++	"shape": [
++		{
++			"section": "Pipe",
++			"title": "OpenAI Files Upload",
++			"properties": [
++				"openai_files_upload.apikey",
++				"openai_files_upload.purpose"
++			]
++		}
++	]
++}
+diff --git a/nodes/src/nodes/tool_attack_goal/IGlobal.py b/nodes/src/nodes/tool_attack_goal/IGlobal.py
+new file mode 100644
+index 00000000..c37c5cc7
+--- /dev/null
++++ b/nodes/src/nodes/tool_attack_goal/IGlobal.py
+@@ -0,0 +1,16 @@
++# =============================================================================
++# Soccer robot tactical tool — global state stub.
++# =============================================================================
++
++"""tool_attack_goal — global (no shared state needed)."""
++
++from __future__ import annotations
++
++from rocketlib import IGlobalBase
++
++
++class IGlobal(IGlobalBase):
++    """Stateless: every invocation just formats and validates the action plan."""
++
++    def beginGlobal(self) -> None:  # noqa: D401
++        return
+diff --git a/nodes/src/nodes/tool_attack_goal/IInstance.py b/nodes/src/nodes/tool_attack_goal/IInstance.py
+new file mode 100644
+index 00000000..1af8f519
+--- /dev/null
++++ b/nodes/src/nodes/tool_attack_goal/IInstance.py
+@@ -0,0 +1,74 @@
++# =============================================================================
++# Soccer robot tactical tool — ATTACK_GOAL.
++#
++# Invoked by the tactician agent. Validates the side parameter and returns a
++# structured action plan that the Webots controller's FSM consumes.
++# =============================================================================
++
++"""tool_attack_goal — walk to the ball and kick it toward the enemy goal."""
++
++from __future__ import annotations
++
++from rocketlib import IInstanceBase, tool_function
++
++from .IGlobal import IGlobal
++
++
++_ALLOWED_SIDES = ("left", "right")
++
++
++class IInstance(IInstanceBase):
++    IGlobal: IGlobal
++
++    @tool_function(
++        input_schema={
++            "type": "object",
++            "required": ["side"],
++            "properties": {
++                "side": {
++                    "type": "string",
++                    "enum": list(_ALLOWED_SIDES),
++                    "description": "Which foot kicks the ball — choose so the kicking foot points at the enemy goal.",
++                },
++                "duration_ms": {
++                    "type": "integer",
++                    "minimum": 1000,
++                    "maximum": 8000,
++                    "default": 4000,
++                    "description": "How long this tactical action should run before the agent re-plans.",
++                },
++                "rationale": {
++                    "type": "string",
++                    "default": "",
++                    "description": "One short sentence explaining why this action was chosen.",
++                },
++            },
++        },
++        output_schema={
++            "type": "object",
++            "properties": {
++                "action": {"type": "string"},
++                "params": {"type": "object"},
++                "duration_ms": {"type": "integer"},
++                "rationale": {"type": "string"},
++            },
++        },
++        description=(
++            "Soccer robot tactical action ATTACK_GOAL: walk toward the ball and "
++            "kick it with the selected foot toward the enemy goal."
++        ),
++    )
++    def execute(self, args):
++        if not isinstance(args, dict):
++            raise ValueError("Tool input must be a JSON object (dict)")
++        side = args.get("side")
++        if side not in _ALLOWED_SIDES:
++            raise ValueError(f"'side' must be one of {_ALLOWED_SIDES}, got {side!r}")
++        duration_ms = int(args.get("duration_ms", 4000))
++        rationale = str(args.get("rationale", ""))
++        return {
++            "action": "ATTACK_GOAL",
++            "params": {"side": side},
++            "duration_ms": duration_ms,
++            "rationale": rationale,
++        }
+diff --git a/nodes/src/nodes/tool_attack_goal/services.json b/nodes/src/nodes/tool_attack_goal/services.json
+new file mode 100644
+index 00000000..45ace95e
+--- /dev/null
++++ b/nodes/src/nodes/tool_attack_goal/services.json
+@@ -0,0 +1,35 @@
++{
++	"title": "Attack Goal",
++	"protocol": "tool_attack_goal://",
++	"classType": ["tool"],
++	"capabilities": ["invoke"],
++	"register": "filter",
++	"node": "python",
++	"path": "nodes.tool_attack_goal",
++	"prefix": "attack_goal",
++	"icon": "rocketride.svg",
++	"documentation": "https://docs.rocketride.org",
++	"description": [
++		"Soccer robot tactical action: walk to the ball and kick it toward the enemy goal.",
++		"Returns a structured action plan that the controller's FSM applies on the next step."
++	],
++	"tile": ["Tool: attack_goal.execute"],
++	"lanes": {},
++	"preconfig": {
++		"default": "default",
++		"profiles": {
++			"default": {
++				"title": "Default",
++				"serverName": "attack_goal"
++			}
++		}
++	},
++	"fields": {},
++	"shape": [
++		{
++			"section": "Pipe",
++			"title": "Attack Goal",
++			"properties": ["type"]
++		}
++	]
++}
+diff --git a/nodes/src/nodes/tool_avoid_line/IGlobal.py b/nodes/src/nodes/tool_avoid_line/IGlobal.py
+new file mode 100644
+index 00000000..1314a9a5
+--- /dev/null
++++ b/nodes/src/nodes/tool_avoid_line/IGlobal.py
+@@ -0,0 +1,8 @@
++"""tool_avoid_line — global (no shared state needed)."""
++from __future__ import annotations
++from rocketlib import IGlobalBase
++
++
++class IGlobal(IGlobalBase):
++    def beginGlobal(self) -> None:
++        return
+diff --git a/nodes/src/nodes/tool_avoid_line/IInstance.py b/nodes/src/nodes/tool_avoid_line/IInstance.py
+new file mode 100644
+index 00000000..c3681184
+--- /dev/null
++++ b/nodes/src/nodes/tool_avoid_line/IInstance.py
+@@ -0,0 +1,63 @@
++"""tool_avoid_line — retreat away from a field line the robot is close to."""
++
++from __future__ import annotations
++
++from rocketlib import IInstanceBase, tool_function
++
++from .IGlobal import IGlobal
++
++
++_ALLOWED_SIDES = ("left", "right", "back")
++
++
++class IInstance(IInstanceBase):
++    IGlobal: IGlobal
++
++    @tool_function(
++        input_schema={
++            "type": "object",
++            "required": ["retreat_side"],
++            "properties": {
++                "retreat_side": {
++                    "type": "string",
++                    "enum": list(_ALLOWED_SIDES),
++                    "description": "Which way to retreat — opposite of the line side ('left'/'right'), or straight 'back'.",
++                },
++                "duration_ms": {
++                    "type": "integer", "minimum": 500, "maximum": 5000, "default": 2000,
++                    "description": "How long to retreat before re-planning.",
++                },
++                "rationale": {
++                    "type": "string", "default": "",
++                    "description": "Why we are retreating now.",
++                },
++            },
++        },
++        output_schema={
++            "type": "object",
++            "properties": {
++                "action": {"type": "string"},
++                "params": {"type": "object"},
++                "duration_ms": {"type": "integer"},
++                "rationale": {"type": "string"},
++            },
++        },
++        description=(
++            "Soccer robot reactive action AVOID_LINE: walk backward and turn away "
++            "from a field boundary line."
++        ),
++    )
++    def execute(self, args):
++        if not isinstance(args, dict):
++            raise ValueError("Tool input must be a JSON object (dict)")
++        retreat_side = args.get("retreat_side")
++        if retreat_side not in _ALLOWED_SIDES:
++            raise ValueError(f"'retreat_side' must be one of {_ALLOWED_SIDES}, got {retreat_side!r}")
++        duration_ms = int(args.get("duration_ms", 2000))
++        rationale = str(args.get("rationale", ""))
++        return {
++            "action": "AVOID_LINE",
++            "params": {"retreat_side": retreat_side},
++            "duration_ms": duration_ms,
++            "rationale": rationale,
++        }
+diff --git a/nodes/src/nodes/tool_avoid_line/services.json b/nodes/src/nodes/tool_avoid_line/services.json
+new file mode 100644
+index 00000000..5caae05a
+--- /dev/null
++++ b/nodes/src/nodes/tool_avoid_line/services.json
+@@ -0,0 +1,28 @@
++{
++	"title": "Avoid Line",
++	"protocol": "tool_avoid_line://",
++	"classType": ["tool"],
++	"capabilities": ["invoke"],
++	"register": "filter",
++	"node": "python",
++	"path": "nodes.tool_avoid_line",
++	"prefix": "avoid_line",
++	"icon": "rocketride.svg",
++	"documentation": "https://docs.rocketride.org",
++	"description": [
++		"Soccer robot tactical action: retreat away from a field line the robot is too close to.",
++		"Returns a structured action plan that the controller's FSM applies on the next step."
++	],
++	"tile": ["Tool: avoid_line.execute"],
++	"lanes": {},
++	"preconfig": {
++		"default": "default",
++		"profiles": {
++			"default": { "title": "Default", "serverName": "avoid_line" }
++		}
++	},
++	"fields": {},
++	"shape": [
++		{ "section": "Pipe", "title": "Avoid Line", "properties": ["type"] }
++	]
++}
+diff --git a/nodes/src/nodes/tool_celebrate/IGlobal.py b/nodes/src/nodes/tool_celebrate/IGlobal.py
+new file mode 100644
+index 00000000..b31fb476
+--- /dev/null
++++ b/nodes/src/nodes/tool_celebrate/IGlobal.py
+@@ -0,0 +1,8 @@
++"""tool_celebrate — global (no shared state needed)."""
++from __future__ import annotations
++from rocketlib import IGlobalBase
++
++
++class IGlobal(IGlobalBase):
++    def beginGlobal(self) -> None:
++        return
+diff --git a/nodes/src/nodes/tool_celebrate/IInstance.py b/nodes/src/nodes/tool_celebrate/IInstance.py
+new file mode 100644
+index 00000000..97458438
+--- /dev/null
++++ b/nodes/src/nodes/tool_celebrate/IInstance.py
+@@ -0,0 +1,55 @@
++"""tool_celebrate — play the celebration motion (e.g. after a goal)."""
++
++from __future__ import annotations
++
++from rocketlib import IInstanceBase, tool_function
++
++from .IGlobal import IGlobal
++
++
++class IInstance(IInstanceBase):
++    IGlobal: IGlobal
++
++    @tool_function(
++        input_schema={
++            "type": "object",
++            "properties": {
++                "rationale": {
++                    "type": "string", "default": "",
++                    "description": "Why we are celebrating (e.g. 'goal scored').",
++                },
++            },
++        },
++        output_schema={
++            "type": "object",
++            "properties": {
++                "action": {"type": "string"},
++                "params": {"type": "object"},
++                "duration_ms": {"type": "integer"},
++                "rationale": {"type": "string"},
++            },
++        },
++        description=(
++            "Soccer robot expressive action CELEBRATE: play the hello/celebration motion. "
++            "Use after a goal or another notable event. Fixed duration ~2s."
++        ),
++    )
++    def execute(self, args):
++        # === DEBUG audit → /tmp/rocketride_debug.log ===
++        try:
++            import json as _j, time as _t
++            with open('/tmp/rocketride_debug.log', 'a') as _f:
++                _f.write(_j.dumps({'t': _t.strftime('%H:%M:%S.%f')[:-3],
++                                   'src': 'tool_celebrate', 'event': 'execute',
++                                   'args': args}, default=str) + '\n')
++        except Exception:
++            pass
++        if not isinstance(args, dict):
++            raise ValueError("Tool input must be a JSON object (dict)")
++        rationale = str(args.get("rationale", ""))
++        return {
++            "action": "CELEBRATE",
++            "params": {},
++            "duration_ms": 2000,
++            "rationale": rationale,
++        }
+diff --git a/nodes/src/nodes/tool_celebrate/__init__.py b/nodes/src/nodes/tool_celebrate/__init__.py
+new file mode 100644
+index 00000000..b76226dc
+--- /dev/null
++++ b/nodes/src/nodes/tool_celebrate/__init__.py
+@@ -0,0 +1,6 @@
++"""Tool celebrate package — soccer expressive action."""
++
++from .IGlobal import IGlobal
++from .IInstance import IInstance
++
++__all__ = ['IGlobal', 'IInstance']
+diff --git a/nodes/src/nodes/tool_celebrate/services.json b/nodes/src/nodes/tool_celebrate/services.json
+new file mode 100644
+index 00000000..a328638d
+--- /dev/null
++++ b/nodes/src/nodes/tool_celebrate/services.json
+@@ -0,0 +1,28 @@
++{
++	"title": "Celebrate",
++	"protocol": "tool_celebrate://",
++	"classType": ["tool"],
++	"capabilities": ["invoke"],
++	"register": "filter",
++	"node": "python",
++	"path": "nodes.tool_celebrate",
++	"prefix": "celebrate",
++	"icon": "rocketride.svg",
++	"documentation": "https://docs.rocketride.org",
++	"description": [
++		"Soccer robot expressive action: play the hello/celebration motion (e.g. after scoring).",
++		"Returns a structured action plan that the controller's FSM applies on the next step."
++	],
++	"tile": ["Tool: celebrate.execute"],
++	"lanes": {},
++	"preconfig": {
++		"default": "default",
++		"profiles": {
++			"default": { "title": "Default", "serverName": "celebrate" }
++		}
++	},
++	"fields": {},
++	"shape": [
++		{ "section": "Pipe", "title": "Celebrate", "properties": ["type"] }
++	]
++}
+diff --git a/nodes/src/nodes/tool_chase_ball/IGlobal.py b/nodes/src/nodes/tool_chase_ball/IGlobal.py
+new file mode 100644
+index 00000000..0b159648
+--- /dev/null
++++ b/nodes/src/nodes/tool_chase_ball/IGlobal.py
+@@ -0,0 +1,8 @@
++"""tool_chase_ball — global (no shared state needed)."""
++from __future__ import annotations
++from rocketlib import IGlobalBase
++
++
++class IGlobal(IGlobalBase):
++    def beginGlobal(self) -> None:
++        return
+diff --git a/nodes/src/nodes/tool_chase_ball/IInstance.py b/nodes/src/nodes/tool_chase_ball/IInstance.py
+new file mode 100644
+index 00000000..75fca1de
+--- /dev/null
++++ b/nodes/src/nodes/tool_chase_ball/IInstance.py
+@@ -0,0 +1,80 @@
++"""tool_chase_ball — reactive 60Hz pursuit + auto-kick when ball is at feet."""
++
++from __future__ import annotations
++
++import json
++import os
++import time
++
++from rocketlib import IInstanceBase, tool_function
++
++from .IGlobal import IGlobal
++
++
++_DEBUG_LOG = "/tmp/rocketride_tool_chase_ball.log"
++
++
++def _audit(msg: str, payload: dict) -> None:
++    try:
++        with open(_DEBUG_LOG, "a", encoding="utf-8") as f:
++            f.write(json.dumps({
++                "t": time.strftime("%H:%M:%S"),
++                "pid": os.getpid(),
++                "msg": msg,
++                "payload": payload,
++            }) + "\n")
++    except OSError:
++        pass
++
++
++class IInstance(IInstanceBase):
++    IGlobal: IGlobal
++
++    @tool_function(
++        input_schema={
++            "type": "object",
++            "properties": {
++                "duration_ms": {
++                    "type": "integer",
++                    "minimum": 2000,
++                    "maximum": 15000,
++                    "default": 8000,
++                    "description": "How long the chase runs at most (ends early if ball is lost or kicked).",
++                },
++                "rationale": {
++                    "type": "string",
++                    "default": "",
++                    "description": "One short sentence explaining the choice.",
++                },
++            },
++        },
++        output_schema={
++            "type": "object",
++            "properties": {
++                "action": {"type": "string"},
++                "params": {"type": "object"},
++                "duration_ms": {"type": "integer"},
++                "rationale": {"type": "string"},
++            },
++        },
++        description=(
++            "Soccer robot complex skill CHASE_BALL: track the ball with the "
++            "head, walk toward it, and kick automatically when it reaches your "
++            "feet. Direction of the kick is the closer foot. Use when ball.visible."
++        ),
++    )
++    def execute(self, args):
++        _audit("invoked", {"args": args})
++        if not isinstance(args, dict):
++            _audit("error_bad_args", {"args": args})
++            raise ValueError("Tool input must be a JSON object (dict)")
++        duration_ms = int(args.get("duration_ms", 8000))
++        rationale = str(args.get("rationale", ""))
++        result = {
++            "action": "CHASE_BALL",
++            "params": {},
++            "duration_ms": duration_ms,
++            "rationale": rationale,
++        }
++        _audit("returning", result)
++        return result
+diff --git a/nodes/src/nodes/tool_chase_ball/__init__.py b/nodes/src/nodes/tool_chase_ball/__init__.py
+new file mode 100644
+index 00000000..0dba41f7
+--- /dev/null
++++ b/nodes/src/nodes/tool_chase_ball/__init__.py
+@@ -0,0 +1,6 @@
++"""Tool chase_ball package — reactive 60Hz chase + auto-kick."""
++
++from .IGlobal import IGlobal
++from .IInstance import IInstance
++
++__all__ = ['IGlobal', 'IInstance']
+diff --git a/nodes/src/nodes/tool_chase_ball/services.json b/nodes/src/nodes/tool_chase_ball/services.json
+new file mode 100644
+index 00000000..2682cbd5
+--- /dev/null
++++ b/nodes/src/nodes/tool_chase_ball/services.json
+@@ -0,0 +1,29 @@
++{
++	"title": "Chase Ball",
++	"protocol": "tool_chase_ball://",
++	"classType": ["tool"],
++	"capabilities": ["invoke"],
++	"register": "filter",
++	"node": "python",
++	"path": "nodes.tool_chase_ball",
++	"prefix": "chase_ball",
++	"icon": "rocketride.svg",
++	"documentation": "https://docs.rocketride.org",
++	"description": [
++		"Soccer robot complex skill: REACTIVE 60Hz BALL CHASE + AUTO-KICK.",
++		"Tracks the ball with the head, walks toward it, kicks when at feet.",
++		"Returns a structured action plan that the controller's FSM applies."
++	],
++	"tile": ["Tool: chase_ball.execute"],
++	"lanes": {},
++	"preconfig": {
++		"default": "default",
++		"profiles": {
++			"default": { "title": "Default", "serverName": "chase_ball" }
++		}
++	},
++	"fields": {},
++	"shape": [
++		{ "section": "Pipe", "title": "Chase Ball", "properties": ["type"] }
++	]
++}
+diff --git a/nodes/src/nodes/tool_defend_area/IGlobal.py b/nodes/src/nodes/tool_defend_area/IGlobal.py
+new file mode 100644
+index 00000000..af439a49
+--- /dev/null
++++ b/nodes/src/nodes/tool_defend_area/IGlobal.py
+@@ -0,0 +1,8 @@
++"""tool_defend_area — global (no shared state needed)."""
++from __future__ import annotations
++from rocketlib import IGlobalBase
++
++
++class IGlobal(IGlobalBase):
++    def beginGlobal(self) -> None:
++        return
+diff --git a/nodes/src/nodes/tool_defend_area/IInstance.py b/nodes/src/nodes/tool_defend_area/IInstance.py
+new file mode 100644
+index 00000000..4b8dcd64
+--- /dev/null
++++ b/nodes/src/nodes/tool_defend_area/IInstance.py
+@@ -0,0 +1,51 @@
++"""tool_defend_area — hold a defensive position, face the ball."""
++
++from __future__ import annotations
++
++from rocketlib import IInstanceBase, tool_function
++
++from .IGlobal import IGlobal
++
++
++class IInstance(IInstanceBase):
++    IGlobal: IGlobal
++
++    @tool_function(
++        input_schema={
++            "type": "object",
++            "properties": {
++                "duration_ms": {
++                    "type": "integer", "minimum": 1000, "maximum": 8000, "default": 4000,
++                    "description": "How long to hold defensive posture before re-planning.",
++                },
++                "rationale": {
++                    "type": "string", "default": "",
++                    "description": "One short sentence explaining why defending now.",
++                },
++            },
++        },
++        output_schema={
++            "type": "object",
++            "properties": {
++                "action": {"type": "string"},
++                "params": {"type": "object"},
++                "duration_ms": {"type": "integer"},
++                "rationale": {"type": "string"},
++            },
++        },
++        description=(
++            "Soccer robot tactical action DEFEND_AREA: stand between ball and own goal, "
++            "face the ball, do not chase."
++        ),
++    )
++    def execute(self, args):
++        if not isinstance(args, dict):
++            raise ValueError("Tool input must be a JSON object (dict)")
++        duration_ms = int(args.get("duration_ms", 4000))
++        rationale = str(args.get("rationale", ""))
++        return {
++            "action": "DEFEND_AREA",
++            "params": {},
++            "duration_ms": duration_ms,
++            "rationale": rationale,
++        }
+diff --git a/nodes/src/nodes/tool_defend_area/services.json b/nodes/src/nodes/tool_defend_area/services.json
+new file mode 100644
+index 00000000..5999c6e3
+--- /dev/null
++++ b/nodes/src/nodes/tool_defend_area/services.json
+@@ -0,0 +1,31 @@
++{
++	"title": "Defend Area",
++	"protocol": "tool_defend_area://",
++	"classType": ["tool"],
++	"capabilities": ["invoke"],
++	"register": "filter",
++	"node": "python",
++	"path": "nodes.tool_defend_area",
++	"prefix": "defend_area",
++	"icon": "rocketride.svg",
++	"documentation": "https://docs.rocketride.org",
++	"description": [
++		"Soccer robot tactical action: hold a defensive position, face the ball.",
++		"Returns a structured action plan that the controller's FSM applies on the next step."
++	],
++	"tile": ["Tool: defend_area.execute"],
++	"lanes": {},
++	"preconfig": {
++		"default": "default",
++		"profiles": {
++			"default": {
++				"title": "Default",
++				"serverName": "defend_area"
++			}
++		}
++	},
++	"fields": {},
++	"shape": [
++		{ "section": "Pipe", "title": "Defend Area", "properties": ["type"] }
++	]
++}
+diff --git a/nodes/src/nodes/tool_drive_to_goal/IGlobal.py b/nodes/src/nodes/tool_drive_to_goal/IGlobal.py
+new file mode 100644
+index 00000000..ae9a31ff
+--- /dev/null
++++ b/nodes/src/nodes/tool_drive_to_goal/IGlobal.py
+@@ -0,0 +1,8 @@
++"""tool_drive_to_goal — global (no shared state needed)."""
++from __future__ import annotations
++from rocketlib import IGlobalBase
++
++
++class IGlobal(IGlobalBase):
++    def beginGlobal(self) -> None:
++        return
+diff --git a/nodes/src/nodes/tool_drive_to_goal/IInstance.py b/nodes/src/nodes/tool_drive_to_goal/IInstance.py
+new file mode 100644
+index 00000000..5adb8c8d
+--- /dev/null
++++ b/nodes/src/nodes/tool_drive_to_goal/IInstance.py
+@@ -0,0 +1,81 @@
++"""tool_drive_to_goal — chase the ball with goal-aligned body bias and shoot."""
++
++from __future__ import annotations
++
++import json
++import os
++import time
++
++from rocketlib import IInstanceBase, tool_function
++
++from .IGlobal import IGlobal
++
++
++_DEBUG_LOG = "/tmp/rocketride_tool_drive_to_goal.log"
++
++
++def _audit(msg: str, payload: dict) -> None:
++    try:
++        with open(_DEBUG_LOG, "a", encoding="utf-8") as f:
++            f.write(json.dumps({
++                "t": time.strftime("%H:%M:%S"),
++                "pid": os.getpid(),
++                "msg": msg,
++                "payload": payload,
++            }) + "\n")
++    except OSError:
++        pass
++
++
++class IInstance(IInstanceBase):
++    IGlobal: IGlobal
++
++    @tool_function(
++        input_schema={
++            "type": "object",
++            "properties": {
++                "duration_ms": {
++                    "type": "integer",
++                    "minimum": 3000,
++                    "maximum": 15000,
++                    "default": 10000,
++                    "description": "How long the drive runs at most (ends early if ball is lost or shot).",
++                },
++                "rationale": {
++                    "type": "string",
++                    "default": "",
++                    "description": "One short sentence explaining why we are shooting now.",
++                },
++            },
++        },
++        output_schema={
++            "type": "object",
++            "properties": {
++                "action": {"type": "string"},
++                "params": {"type": "object"},
++                "duration_ms": {"type": "integer"},
++                "rationale": {"type": "string"},
++            },
++        },
++        description=(
++            "Soccer robot complex skill DRIVE_TO_GOAL: chase the ball with the "
++            "body yaw biased toward the goal direction, kick AIMED at the goal "
++            "when the ball is at your feet AND the goal is roughly ahead. Use "
++            "when ball.visible AND you have goal info (goal.visible or goal_memory)."
++        ),
++    )
++    def execute(self, args):
++        _audit("invoked", {"args": args})
++        if not isinstance(args, dict):
++            _audit("error_bad_args", {"args": args})
++            raise ValueError("Tool input must be a JSON object (dict)")
++        duration_ms = int(args.get("duration_ms", 10000))
++        rationale = str(args.get("rationale", ""))
++        result = {
++            "action": "DRIVE_TO_GOAL",
++            "params": {},
++            "duration_ms": duration_ms,
++            "rationale": rationale,
++        }
++        _audit("returning", result)
++        return result
+diff --git a/nodes/src/nodes/tool_drive_to_goal/__init__.py b/nodes/src/nodes/tool_drive_to_goal/__init__.py
+new file mode 100644
+index 00000000..29f890fa
+--- /dev/null
++++ b/nodes/src/nodes/tool_drive_to_goal/__init__.py
+@@ -0,0 +1,6 @@
++"""Tool drive_to_goal package — chase + goal-aimed shot."""
++
++from .IGlobal import IGlobal
++from .IInstance import IInstance
++
++__all__ = ['IGlobal', 'IInstance']
+diff --git a/nodes/src/nodes/tool_drive_to_goal/services.json b/nodes/src/nodes/tool_drive_to_goal/services.json
+new file mode 100644
+index 00000000..9cbdbb68
+--- /dev/null
++++ b/nodes/src/nodes/tool_drive_to_goal/services.json
+@@ -0,0 +1,29 @@
++{
++	"title": "Drive Ball to Goal",
++	"protocol": "tool_drive_to_goal://",
++	"classType": ["tool"],
++	"capabilities": ["invoke"],
++	"register": "filter",
++	"node": "python",
++	"path": "nodes.tool_drive_to_goal",
++	"prefix": "drive_to_goal",
++	"icon": "rocketride.svg",
++	"documentation": "https://docs.rocketride.org",
++	"description": [
++		"Soccer robot complex skill: DRIVE THE BALL TO THE GOAL AND SHOOT.",
++		"Chases the ball with body biased toward the goal direction; kicks only when the goal is roughly ahead so the shot has direction.",
++		"Returns a structured action plan that the controller's FSM applies."
++	],
++	"tile": ["Tool: drive_to_goal.execute"],
++	"lanes": {},
++	"preconfig": {
++		"default": "default",
++		"profiles": {
++			"default": { "title": "Default", "serverName": "drive_to_goal" }
++		}
++	},
++	"fields": {},
++	"shape": [
++		{ "section": "Pipe", "title": "Drive to Goal", "properties": ["type"] }
++	]
++}
+diff --git a/nodes/src/nodes/tool_find_ball/IGlobal.py b/nodes/src/nodes/tool_find_ball/IGlobal.py
+new file mode 100644
+index 00000000..d30106d1
+--- /dev/null
++++ b/nodes/src/nodes/tool_find_ball/IGlobal.py
+@@ -0,0 +1,8 @@
++"""tool_find_ball — global (no shared state needed)."""
++from __future__ import annotations
++from rocketlib import IGlobalBase
++
++
++class IGlobal(IGlobalBase):
++    def beginGlobal(self) -> None:
++        return
+diff --git a/nodes/src/nodes/tool_find_ball/IInstance.py b/nodes/src/nodes/tool_find_ball/IInstance.py
+new file mode 100644
+index 00000000..ca8e9b1d
+--- /dev/null
++++ b/nodes/src/nodes/tool_find_ball/IInstance.py
+@@ -0,0 +1,80 @@
++"""tool_find_ball — autonomous ball search (head sweep + body rotation)."""
++
++from __future__ import annotations
++
++import json
++import os
++import time
++
++from rocketlib import IInstanceBase, tool_function
++
++from .IGlobal import IGlobal
++
++
++_DEBUG_LOG = "/tmp/rocketride_tool_find_ball.log"
++
++
++def _audit(msg: str, payload: dict) -> None:
++    """Append a single line to a debug log so we can verify the node runs."""
++    try:
++        with open(_DEBUG_LOG, "a", encoding="utf-8") as f:
++            f.write(json.dumps({
++                "t": time.strftime("%H:%M:%S"),
++                "pid": os.getpid(),
++                "msg": msg,
++                "payload": payload,
++            }) + "\n")
++    except OSError:
++        pass
++
++
++class IInstance(IInstanceBase):
++    IGlobal: IGlobal
++
++    @tool_function(
++        input_schema={
++            "type": "object",
++            "properties": {
++                "duration_ms": {
++                    "type": "integer",
++                    "minimum": 2000,
++                    "maximum": 20000,
++                    "default": 12000,
++                    "description": "How long the search runs at most (ends early when the ball is acquired).",
++                },
++                "rationale": {
++                    "type": "string",
++                    "default": "",
++                    "description": "One short sentence explaining why we are searching.",
++                },
++            },
++        },
++        output_schema={
++            "type": "object",
++            "properties": {
++                "action": {"type": "string"},
++                "params": {"type": "object"},
++                "duration_ms": {"type": "integer"},
++                "rationale": {"type": "string"},
++            },
++        },
++        description=(
++            "Soccer robot complex skill FIND_BALL: sweep head + rotate body "
++            "until the ball is in the camera frame. Use when ball.visible is False."
++        ),
++    )
++    def execute(self, args):
++        _audit("invoked", {"args": args})
++        if not isinstance(args, dict):
++            _audit("error_bad_args", {"args": args})
++            raise ValueError("Tool input must be a JSON object (dict)")
++        duration_ms = int(args.get("duration_ms", 12000))
++        rationale = str(args.get("rationale", ""))
++        result = {
++            "action": "FIND_BALL",
++            "params": {},
++            "duration_ms": duration_ms,
++            "rationale": rationale,
++        }
++        _audit("returning", result)
++        return result
+diff --git a/nodes/src/nodes/tool_find_ball/__init__.py b/nodes/src/nodes/tool_find_ball/__init__.py
+new file mode 100644
+index 00000000..15c947c5
+--- /dev/null
++++ b/nodes/src/nodes/tool_find_ball/__init__.py
+@@ -0,0 +1,6 @@
++"""Tool find_ball package — autonomous ball search."""
++
++from .IGlobal import IGlobal
++from .IInstance import IInstance
++
++__all__ = ['IGlobal', 'IInstance']
+diff --git a/nodes/src/nodes/tool_find_ball/services.json b/nodes/src/nodes/tool_find_ball/services.json
+new file mode 100644
+index 00000000..5e5a3b13
+--- /dev/null
++++ b/nodes/src/nodes/tool_find_ball/services.json
+@@ -0,0 +1,29 @@
++{
++	"title": "Find Ball",
++	"protocol": "tool_find_ball://",
++	"classType": ["tool"],
++	"capabilities": ["invoke"],
++	"register": "filter",
++	"node": "python",
++	"path": "nodes.tool_find_ball",
++	"prefix": "find_ball",
++	"icon": "rocketride.svg",
++	"documentation": "https://docs.rocketride.org",
++	"description": [
++		"Soccer robot complex skill: AUTONOMOUS BALL SEARCH.",
++		"Sweeps the head and rotates the body until the ball is in view.",
++		"Returns a structured action plan that the controller's FSM applies."
++	],
++	"tile": ["Tool: find_ball.execute"],
++	"lanes": {},
++	"preconfig": {
++		"default": "default",
++		"profiles": {
++			"default": { "title": "Default", "serverName": "find_ball" }
++		}
++	},
++	"fields": {},
++	"shape": [
++		{ "section": "Pipe", "title": "Find Ball", "properties": ["type"] }
++	]
++}
+diff --git a/nodes/src/nodes/tool_idle/IGlobal.py b/nodes/src/nodes/tool_idle/IGlobal.py
+new file mode 100644
+index 00000000..774e61a4
+--- /dev/null
++++ b/nodes/src/nodes/tool_idle/IGlobal.py
+@@ -0,0 +1,8 @@
++"""tool_idle — global (no shared state needed)."""
++from __future__ import annotations
++from rocketlib import IGlobalBase
++
++
++class IGlobal(IGlobalBase):
++    def beginGlobal(self) -> None:
++        return
+diff --git a/nodes/src/nodes/tool_idle/IInstance.py b/nodes/src/nodes/tool_idle/IInstance.py
+new file mode 100644
+index 00000000..7d8c4a0c
+--- /dev/null
++++ b/nodes/src/nodes/tool_idle/IInstance.py
+@@ -0,0 +1,51 @@
++"""tool_idle — stand still and observe."""
++
++from __future__ import annotations
++
++from rocketlib import IInstanceBase, tool_function
++
++from .IGlobal import IGlobal
++
++
++class IInstance(IInstanceBase):
++    IGlobal: IGlobal
++
++    @tool_function(
++        input_schema={
++            "type": "object",
++            "properties": {
++                "duration_ms": {
++                    "type": "integer", "minimum": 500, "maximum": 6000, "default": 2000,
++                    "description": "How long to stand still before re-planning.",
++                },
++                "rationale": {
++                    "type": "string", "default": "",
++                    "description": "Why standing still (e.g. 'observing, no clear target').",
++                },
++            },
++        },
++        output_schema={
++            "type": "object",
++            "properties": {
++                "action": {"type": "string"},
++                "params": {"type": "object"},
++                "duration_ms": {"type": "integer"},
++                "rationale": {"type": "string"},
++            },
++        },
++        description=(
++            "Soccer robot fallback action IDLE: stand still and observe. Use when no "
++            "clear tactical action applies."
++        ),
++    )
++    def execute(self, args):
++        if not isinstance(args, dict):
++            raise ValueError("Tool input must be a JSON object (dict)")
++        duration_ms = int(args.get("duration_ms", 2000))
++        rationale = str(args.get("rationale", ""))
++        return {
++            "action": "IDLE",
++            "params": {},
++            "duration_ms": duration_ms,
++            "rationale": rationale,
++        }
+diff --git a/nodes/src/nodes/tool_idle/services.json b/nodes/src/nodes/tool_idle/services.json
+new file mode 100644
+index 00000000..4ca6541e
+--- /dev/null
++++ b/nodes/src/nodes/tool_idle/services.json
+@@ -0,0 +1,28 @@
++{
++	"title": "Idle",
++	"protocol": "tool_idle://",
++	"classType": ["tool"],
++	"capabilities": ["invoke"],
++	"register": "filter",
++	"node": "python",
++	"path": "nodes.tool_idle",
++	"prefix": "idle",
++	"icon": "rocketride.svg",
++	"documentation": "https://docs.rocketride.org",
++	"description": [
++		"Soccer robot tactical action: stand still and observe the world.",
++		"Returns a structured action plan that the controller's FSM applies on the next step."
++	],
++	"tile": ["Tool: idle.execute"],
++	"lanes": {},
++	"preconfig": {
++		"default": "default",
++		"profiles": {
++			"default": { "title": "Default", "serverName": "idle" }
++		}
++	},
++	"fields": {},
++	"shape": [
++		{ "section": "Pipe", "title": "Idle", "properties": ["type"] }
++	]
++}
+diff --git a/nodes/src/nodes/tool_kick/IGlobal.py b/nodes/src/nodes/tool_kick/IGlobal.py
+new file mode 100644
+index 00000000..5f68d604
+--- /dev/null
++++ b/nodes/src/nodes/tool_kick/IGlobal.py
+@@ -0,0 +1,8 @@
++"""tool kick — global (no shared state)."""
++from __future__ import annotations
++from rocketlib import IGlobalBase
++
++
++class IGlobal(IGlobalBase):
++    def beginGlobal(self) -> None:
++        return
+diff --git a/nodes/src/nodes/tool_kick/IInstance.py b/nodes/src/nodes/tool_kick/IInstance.py
+new file mode 100644
+index 00000000..f9bdf131
+--- /dev/null
++++ b/nodes/src/nodes/tool_kick/IInstance.py
+@@ -0,0 +1,39 @@
++"""tool_kick — atomic skill emitting action KICK."""
++
++from __future__ import annotations
++
++from rocketlib import IInstanceBase, tool_function
++
++from .IGlobal import IGlobal
++
++
++class IInstance(IInstanceBase):
++    IGlobal: IGlobal
++
++    @tool_function(
++        input_schema={"type": "object", "properties": {"duration_ms": {"type": "integer", "default": 2500, "description": "How long this action runs (ms)."}, "rationale": {"type": "string", "default": "", "description": "One short sentence reason."}, "side": {"type": "string", "enum": ["left", "right"], "default": "right", "description": "Which foot kicks."}}},
++        output_schema={"type": "object",
++                       "properties": {"action": {"type": "string"},
++                                      "params": {"type": "object"},
++                                      "duration_ms": {"type": "integer"},
++                                      "rationale": {"type": "string"}}},
++        description="Soccer robot atomic skill KICK: Kick the ball. side: left|right (which foot kicks).",
++    )
++    def execute(self, args):
++        try:
++            import json as _j, time as _t
++            with open('/tmp/rocketride_debug.log', 'a') as _f:
++                _f.write(_j.dumps({'t': _t.strftime('%H:%M:%S.%f')[:-3],
++                    'src': 'tool_kick', 'event': 'execute', 'args': args},
++                    default=str) + '\n')
++        except Exception:
++            pass
++
++        params = {}
++        if not isinstance(args, dict):
++            args = {}
++        duration_ms = int(args.get("duration_ms", 2500))
++        rationale = str(args.get("rationale", ""))
++        params = {"side": str(args.get("side", "right"))}
++        return {"action": "KICK", "params": params,
++                "duration_ms": duration_ms, "rationale": rationale}
+diff --git a/nodes/src/nodes/tool_kick/__init__.py b/nodes/src/nodes/tool_kick/__init__.py
+new file mode 100644
+index 00000000..7d281924
+--- /dev/null
++++ b/nodes/src/nodes/tool_kick/__init__.py
+@@ -0,0 +1,5 @@
++"""Tool kick package — atomic skill node."""
++from .IGlobal import IGlobal
++from .IInstance import IInstance
++
++__all__ = ['IGlobal', 'IInstance']
+diff --git a/nodes/src/nodes/tool_kick/services.json b/nodes/src/nodes/tool_kick/services.json
+new file mode 100644
+index 00000000..75457d57
+--- /dev/null
++++ b/nodes/src/nodes/tool_kick/services.json
+@@ -0,0 +1,43 @@
++{
++	"title": "Kick",
++	"protocol": "tool_kick://",
++	"classType": [
++		"tool"
++	],
++	"capabilities": [
++		"invoke"
++	],
++	"register": "filter",
++	"node": "python",
++	"path": "nodes.tool_kick",
++	"prefix": "kick",
++	"icon": "rocketride.svg",
++	"documentation": "https://docs.rocketride.org",
++	"description": [
++		"Kick the ball. side: left|right (which foot kicks).",
++		"Returns a structured action plan that the controller's FSM applies on the next step."
++	],
++	"tile": [
++		"Tool: kick.execute"
++	],
++	"lanes": {},
++	"preconfig": {
++		"default": "default",
++		"profiles": {
++			"default": {
++				"title": "Default",
++				"serverName": "kick"
++			}
++		}
++	},
++	"fields": {},
++	"shape": [
++		{
++			"section": "Pipe",
++			"title": "Kick",
++			"properties": [
++				"type"
++			]
++		}
++	]
++}
+\ No newline at end of file
+diff --git a/nodes/src/nodes/tool_look/IGlobal.py b/nodes/src/nodes/tool_look/IGlobal.py
+new file mode 100644
+index 00000000..705abc3c
+--- /dev/null
++++ b/nodes/src/nodes/tool_look/IGlobal.py
+@@ -0,0 +1,8 @@
++"""tool look — global (no shared state)."""
++from __future__ import annotations
++from rocketlib import IGlobalBase
++
++
++class IGlobal(IGlobalBase):
++    def beginGlobal(self) -> None:
++        return
+diff --git a/nodes/src/nodes/tool_look/IInstance.py b/nodes/src/nodes/tool_look/IInstance.py
+new file mode 100644
+index 00000000..af6df3a4
+--- /dev/null
++++ b/nodes/src/nodes/tool_look/IInstance.py
+@@ -0,0 +1,39 @@
++"""tool_look — atomic skill emitting action LOOK."""
++
++from __future__ import annotations
++
++from rocketlib import IInstanceBase, tool_function
++
++from .IGlobal import IGlobal
++
++
++class IInstance(IInstanceBase):
++    IGlobal: IGlobal
++
++    @tool_function(
++        input_schema={"type": "object", "properties": {"duration_ms": {"type": "integer", "default": 900, "description": "How long this action runs (ms)."}, "rationale": {"type": "string", "default": "", "description": "One short sentence reason."}, "direction": {"type": "string", "enum": ["down", "up", "left", "right", "center"], "default": "center", "description": "Where to point the head."}}},
++        output_schema={"type": "object",
++                       "properties": {"action": {"type": "string"},
++                                      "params": {"type": "object"},
++                                      "duration_ms": {"type": "integer"},
++                                      "rationale": {"type": "string"}}},
++        description="Soccer robot atomic skill LOOK: Move ONLY the head/neck (body still). direction: down|up|left|right|center.",
++    )
++    def execute(self, args):
++        try:
++            import json as _j, time as _t
++            with open('/tmp/rocketride_debug.log', 'a') as _f:
++                _f.write(_j.dumps({'t': _t.strftime('%H:%M:%S.%f')[:-3],
++                    'src': 'tool_look', 'event': 'execute', 'args': args},
++                    default=str) + '\n')
++        except Exception:
++            pass
++
++        params = {}
++        if not isinstance(args, dict):
++            args = {}
++        duration_ms = int(args.get("duration_ms", 900))
++        rationale = str(args.get("rationale", ""))
++        params = {"direction": str(args.get("direction", "center"))}
++        return {"action": "LOOK", "params": params,
++                "duration_ms": duration_ms, "rationale": rationale}
+diff --git a/nodes/src/nodes/tool_look/__init__.py b/nodes/src/nodes/tool_look/__init__.py
+new file mode 100644
+index 00000000..4d1953da
+--- /dev/null
++++ b/nodes/src/nodes/tool_look/__init__.py
+@@ -0,0 +1,5 @@
++"""Tool look package — atomic skill node."""
++from .IGlobal import IGlobal
++from .IInstance import IInstance
++
++__all__ = ['IGlobal', 'IInstance']
+diff --git a/nodes/src/nodes/tool_look/services.json b/nodes/src/nodes/tool_look/services.json
+new file mode 100644
+index 00000000..2423d6fa
+--- /dev/null
++++ b/nodes/src/nodes/tool_look/services.json
+@@ -0,0 +1,43 @@
++{
++	"title": "Look",
++	"protocol": "tool_look://",
++	"classType": [
++		"tool"
++	],
++	"capabilities": [
++		"invoke"
++	],
++	"register": "filter",
++	"node": "python",
++	"path": "nodes.tool_look",
++	"prefix": "look",
++	"icon": "rocketride.svg",
++	"documentation": "https://docs.rocketride.org",
++	"description": [
++		"Move ONLY the head/neck (body still). direction: down|up|left|right|center.",
++		"Returns a structured action plan that the controller's FSM applies on the next step."
++	],
++	"tile": [
++		"Tool: look.execute"
++	],
++	"lanes": {},
++	"preconfig": {
++		"default": "default",
++		"profiles": {
++			"default": {
++				"title": "Default",
++				"serverName": "look"
++			}
++		}
++	},
++	"fields": {},
++	"shape": [
++		{
++			"section": "Pipe",
++			"title": "Look",
++			"properties": [
++				"type"
++			]
++		}
++	]
++}
+\ No newline at end of file
+diff --git a/nodes/src/nodes/tool_recover_ball/IGlobal.py b/nodes/src/nodes/tool_recover_ball/IGlobal.py
+new file mode 100644
+index 00000000..f8276829
+--- /dev/null
++++ b/nodes/src/nodes/tool_recover_ball/IGlobal.py
+@@ -0,0 +1,8 @@
++"""tool_recover_ball — global (no shared state needed)."""
++from __future__ import annotations
++from rocketlib import IGlobalBase
++
++
++class IGlobal(IGlobalBase):
++    def beginGlobal(self) -> None:
++        return
+diff --git a/nodes/src/nodes/tool_recover_ball/IInstance.py b/nodes/src/nodes/tool_recover_ball/IInstance.py
+new file mode 100644
+index 00000000..15d96e95
+--- /dev/null
++++ b/nodes/src/nodes/tool_recover_ball/IInstance.py
+@@ -0,0 +1,51 @@
++"""tool_recover_ball — search for a lost ball."""
++
++from __future__ import annotations
++
++from rocketlib import IInstanceBase, tool_function
++
++from .IGlobal import IGlobal
++
++
++class IInstance(IInstanceBase):
++    IGlobal: IGlobal
++
++    @tool_function(
++        input_schema={
++            "type": "object",
++            "properties": {
++                "duration_ms": {
++                    "type": "integer", "minimum": 1000, "maximum": 8000, "default": 3000,
++                    "description": "How long to search before re-planning.",
++                },
++                "rationale": {
++                    "type": "string", "default": "",
++                    "description": "Why the ball was lost / why we're searching.",
++                },
++            },
++        },
++        output_schema={
++            "type": "object",
++            "properties": {
++                "action": {"type": "string"},
++                "params": {"type": "object"},
++                "duration_ms": {"type": "integer"},
++                "rationale": {"type": "string"},
++            },
++        },
++        description=(
++            "Soccer robot tactical action RECOVER_BALL: spin in place and sweep the "
++            "head to relocate a lost ball."
++        ),
++    )
++    def execute(self, args):
++        if not isinstance(args, dict):
++            raise ValueError("Tool input must be a JSON object (dict)")
++        duration_ms = int(args.get("duration_ms", 3000))
++        rationale = str(args.get("rationale", ""))
++        return {
++            "action": "RECOVER_BALL",
++            "params": {},
++            "duration_ms": duration_ms,
++            "rationale": rationale,
++        }
+diff --git a/nodes/src/nodes/tool_recover_ball/services.json b/nodes/src/nodes/tool_recover_ball/services.json
+new file mode 100644
+index 00000000..fc134b77
+--- /dev/null
++++ b/nodes/src/nodes/tool_recover_ball/services.json
+@@ -0,0 +1,28 @@
++{
++	"title": "Recover Ball",
++	"protocol": "tool_recover_ball://",
++	"classType": ["tool"],
++	"capabilities": ["invoke"],
++	"register": "filter",
++	"node": "python",
++	"path": "nodes.tool_recover_ball",
++	"prefix": "recover_ball",
++	"icon": "rocketride.svg",
++	"documentation": "https://docs.rocketride.org",
++	"description": [
++		"Soccer robot tactical action: search for a lost ball by spinning and sweeping the head.",
++		"Returns a structured action plan that the controller's FSM applies on the next step."
++	],
++	"tile": ["Tool: recover_ball.execute"],
++	"lanes": {},
++	"preconfig": {
++		"default": "default",
++		"profiles": {
++			"default": { "title": "Default", "serverName": "recover_ball" }
++		}
++	},
++	"fields": {},
++	"shape": [
++		{ "section": "Pipe", "title": "Recover Ball", "properties": ["type"] }
++	]
++}
+diff --git a/nodes/src/nodes/tool_sidestep_left/IGlobal.py b/nodes/src/nodes/tool_sidestep_left/IGlobal.py
+new file mode 100644
+index 00000000..2d98ade7
+--- /dev/null
++++ b/nodes/src/nodes/tool_sidestep_left/IGlobal.py
+@@ -0,0 +1,8 @@
++"""tool sidestep_left — global (no shared state)."""
++from __future__ import annotations
++from rocketlib import IGlobalBase
++
++
++class IGlobal(IGlobalBase):
++    def beginGlobal(self) -> None:
++        return
+diff --git a/nodes/src/nodes/tool_sidestep_left/IInstance.py b/nodes/src/nodes/tool_sidestep_left/IInstance.py
+new file mode 100644
+index 00000000..d55bd0a0
+--- /dev/null
++++ b/nodes/src/nodes/tool_sidestep_left/IInstance.py
+@@ -0,0 +1,38 @@
++"""tool_sidestep_left — atomic skill emitting action SIDESTEP_LEFT."""
++
++from __future__ import annotations
++
++from rocketlib import IInstanceBase, tool_function
++
++from .IGlobal import IGlobal
++
++
++class IInstance(IInstanceBase):
++    IGlobal: IGlobal
++
++    @tool_function(
++        input_schema={"type": "object", "properties": {"duration_ms": {"type": "integer", "default": 2000, "description": "How long this action runs (ms)."}, "rationale": {"type": "string", "default": "", "description": "One short sentence reason."}}},
++        output_schema={"type": "object",
++                       "properties": {"action": {"type": "string"},
++                                      "params": {"type": "object"},
++                                      "duration_ms": {"type": "integer"},
++                                      "rationale": {"type": "string"}}},
++        description="Soccer robot atomic skill SIDESTEP_LEFT: Strafe LEFT without turning the body. Circle the ball without losing sight.",
++    )
++    def execute(self, args):
++        try:
++            import json as _j, time as _t
++            with open('/tmp/rocketride_debug.log', 'a') as _f:
++                _f.write(_j.dumps({'t': _t.strftime('%H:%M:%S.%f')[:-3],
++                    'src': 'tool_sidestep_left', 'event': 'execute', 'args': args},
++                    default=str) + '\n')
++        except Exception:
++            pass
++
++        params = {}
++        if not isinstance(args, dict):
++            args = {}
++        duration_ms = int(args.get("duration_ms", 2000))
++        rationale = str(args.get("rationale", ""))
++        return {"action": "SIDESTEP_LEFT", "params": params,
++                "duration_ms": duration_ms, "rationale": rationale}
+diff --git a/nodes/src/nodes/tool_sidestep_left/__init__.py b/nodes/src/nodes/tool_sidestep_left/__init__.py
+new file mode 100644
+index 00000000..8327cadb
+--- /dev/null
++++ b/nodes/src/nodes/tool_sidestep_left/__init__.py
+@@ -0,0 +1,5 @@
++"""Tool sidestep_left package — atomic skill node."""
++from .IGlobal import IGlobal
++from .IInstance import IInstance
++
++__all__ = ['IGlobal', 'IInstance']
+diff --git a/nodes/src/nodes/tool_sidestep_left/services.json b/nodes/src/nodes/tool_sidestep_left/services.json
+new file mode 100644
+index 00000000..4d628199
+--- /dev/null
++++ b/nodes/src/nodes/tool_sidestep_left/services.json
+@@ -0,0 +1,43 @@
++{
++	"title": "Sidestep Left",
++	"protocol": "tool_sidestep_left://",
++	"classType": [
++		"tool"
++	],
++	"capabilities": [
++		"invoke"
++	],
++	"register": "filter",
++	"node": "python",
++	"path": "nodes.tool_sidestep_left",
++	"prefix": "sidestep_left",
++	"icon": "rocketride.svg",
++	"documentation": "https://docs.rocketride.org",
++	"description": [
++		"Strafe LEFT without turning the body. Circle the ball without losing sight.",
++		"Returns a structured action plan that the controller's FSM applies on the next step."
++	],
++	"tile": [
++		"Tool: sidestep_left.execute"
++	],
++	"lanes": {},
++	"preconfig": {
++		"default": "default",
++		"profiles": {
++			"default": {
++				"title": "Default",
++				"serverName": "sidestep_left"
++			}
++		}
++	},
++	"fields": {},
++	"shape": [
++		{
++			"section": "Pipe",
++			"title": "Sidestep Left",
++			"properties": [
++				"type"
++			]
++		}
++	]
++}
+\ No newline at end of file
+diff --git a/nodes/src/nodes/tool_sidestep_right/IGlobal.py b/nodes/src/nodes/tool_sidestep_right/IGlobal.py
+new file mode 100644
+index 00000000..c45a8112
+--- /dev/null
++++ b/nodes/src/nodes/tool_sidestep_right/IGlobal.py
+@@ -0,0 +1,8 @@
++"""tool sidestep_right — global (no shared state)."""
++from __future__ import annotations
++from rocketlib import IGlobalBase
++
++
++class IGlobal(IGlobalBase):
++    def beginGlobal(self) -> None:
++        return
+diff --git a/nodes/src/nodes/tool_sidestep_right/IInstance.py b/nodes/src/nodes/tool_sidestep_right/IInstance.py
+new file mode 100644
+index 00000000..87bfcb22
+--- /dev/null
++++ b/nodes/src/nodes/tool_sidestep_right/IInstance.py
+@@ -0,0 +1,38 @@
++"""tool_sidestep_right — atomic skill emitting action SIDESTEP_RIGHT."""
++
++from __future__ import annotations
++
++from rocketlib import IInstanceBase, tool_function
++
++from .IGlobal import IGlobal
++
++
++class IInstance(IInstanceBase):
++    IGlobal: IGlobal
++
++    @tool_function(
++        input_schema={"type": "object", "properties": {"duration_ms": {"type": "integer", "default": 2000, "description": "How long this action runs (ms)."}, "rationale": {"type": "string", "default": "", "description": "One short sentence reason."}}},
++        output_schema={"type": "object",
++                       "properties": {"action": {"type": "string"},
++                                      "params": {"type": "object"},
++                                      "duration_ms": {"type": "integer"},
++                                      "rationale": {"type": "string"}}},
++        description="Soccer robot atomic skill SIDESTEP_RIGHT: Strafe RIGHT without turning the body.",
++    )
++    def execute(self, args):
++        try:
++            import json as _j, time as _t
++            with open('/tmp/rocketride_debug.log', 'a') as _f:
++                _f.write(_j.dumps({'t': _t.strftime('%H:%M:%S.%f')[:-3],
++                    'src': 'tool_sidestep_right', 'event': 'execute', 'args': args},
++                    default=str) + '\n')
++        except Exception:
++            pass
++
++        params = {}
++        if not isinstance(args, dict):
++            args = {}
++        duration_ms = int(args.get("duration_ms", 2000))
++        rationale = str(args.get("rationale", ""))
++        return {"action": "SIDESTEP_RIGHT", "params": params,
++                "duration_ms": duration_ms, "rationale": rationale}
+diff --git a/nodes/src/nodes/tool_sidestep_right/__init__.py b/nodes/src/nodes/tool_sidestep_right/__init__.py
+new file mode 100644
+index 00000000..1c430e06
+--- /dev/null
++++ b/nodes/src/nodes/tool_sidestep_right/__init__.py
+@@ -0,0 +1,5 @@
++"""Tool sidestep_right package — atomic skill node."""
++from .IGlobal import IGlobal
++from .IInstance import IInstance
++
++__all__ = ['IGlobal', 'IInstance']
+diff --git a/nodes/src/nodes/tool_sidestep_right/services.json b/nodes/src/nodes/tool_sidestep_right/services.json
+new file mode 100644
+index 00000000..78afeb3e
+--- /dev/null
++++ b/nodes/src/nodes/tool_sidestep_right/services.json
+@@ -0,0 +1,43 @@
++{
++	"title": "Sidestep Right",
++	"protocol": "tool_sidestep_right://",
++	"classType": [
++		"tool"
++	],
++	"capabilities": [
++		"invoke"
++	],
++	"register": "filter",
++	"node": "python",
++	"path": "nodes.tool_sidestep_right",
++	"prefix": "sidestep_right",
++	"icon": "rocketride.svg",
++	"documentation": "https://docs.rocketride.org",
++	"description": [
++		"Strafe RIGHT without turning the body.",
++		"Returns a structured action plan that the controller's FSM applies on the next step."
++	],
++	"tile": [
++		"Tool: sidestep_right.execute"
++	],
++	"lanes": {},
++	"preconfig": {
++		"default": "default",
++		"profiles": {
++			"default": {
++				"title": "Default",
++				"serverName": "sidestep_right"
++			}
++		}
++	},
++	"fields": {},
++	"shape": [
++		{
++			"section": "Pipe",
++			"title": "Sidestep Right",
++			"properties": [
++				"type"
++			]
++		}
++	]
++}
+\ No newline at end of file
+diff --git a/nodes/src/nodes/tool_step_back/IGlobal.py b/nodes/src/nodes/tool_step_back/IGlobal.py
+new file mode 100644
+index 00000000..1e1ef76b
+--- /dev/null
++++ b/nodes/src/nodes/tool_step_back/IGlobal.py
+@@ -0,0 +1,8 @@
++"""tool step_back — global (no shared state)."""
++from __future__ import annotations
++from rocketlib import IGlobalBase
++
++
++class IGlobal(IGlobalBase):
++    def beginGlobal(self) -> None:
++        return
+diff --git a/nodes/src/nodes/tool_step_back/IInstance.py b/nodes/src/nodes/tool_step_back/IInstance.py
+new file mode 100644
+index 00000000..c54d2851
+--- /dev/null
++++ b/nodes/src/nodes/tool_step_back/IInstance.py
+@@ -0,0 +1,38 @@
++"""tool_step_back — atomic skill emitting action STEP_BACK."""
++
++from __future__ import annotations
++
++from rocketlib import IInstanceBase, tool_function
++
++from .IGlobal import IGlobal
++
++
++class IInstance(IInstanceBase):
++    IGlobal: IGlobal
++
++    @tool_function(
++        input_schema={"type": "object", "properties": {"duration_ms": {"type": "integer", "default": 1500, "description": "How long this action runs (ms)."}, "rationale": {"type": "string", "default": "", "description": "One short sentence reason."}}},
++        output_schema={"type": "object",
++                       "properties": {"action": {"type": "string"},
++                                      "params": {"type": "object"},
++                                      "duration_ms": {"type": "integer"},
++                                      "rationale": {"type": "string"}}},
++        description="Soccer robot atomic skill STEP_BACK: Take a small step BACKWARD. Perception recovery — never as defense.",
++    )
++    def execute(self, args):
++        try:
++            import json as _j, time as _t
++            with open('/tmp/rocketride_debug.log', 'a') as _f:
++                _f.write(_j.dumps({'t': _t.strftime('%H:%M:%S.%f')[:-3],
++                    'src': 'tool_step_back', 'event': 'execute', 'args': args},
++                    default=str) + '\n')
++        except Exception:
++            pass
++
++        params = {}
++        if not isinstance(args, dict):
++            args = {}
++        duration_ms = int(args.get("duration_ms", 1500))
++        rationale = str(args.get("rationale", ""))
++        return {"action": "STEP_BACK", "params": params,
++                "duration_ms": duration_ms, "rationale": rationale}
+diff --git a/nodes/src/nodes/tool_step_back/__init__.py b/nodes/src/nodes/tool_step_back/__init__.py
+new file mode 100644
+index 00000000..f149adae
+--- /dev/null
++++ b/nodes/src/nodes/tool_step_back/__init__.py
+@@ -0,0 +1,5 @@
++"""Tool step_back package — atomic skill node."""
++from .IGlobal import IGlobal
++from .IInstance import IInstance
++
++__all__ = ['IGlobal', 'IInstance']
+diff --git a/nodes/src/nodes/tool_step_back/services.json b/nodes/src/nodes/tool_step_back/services.json
+new file mode 100644
+index 00000000..7ace5b9b
+--- /dev/null
++++ b/nodes/src/nodes/tool_step_back/services.json
+@@ -0,0 +1,43 @@
++{
++	"title": "Step Back",
++	"protocol": "tool_step_back://",
++	"classType": [
++		"tool"
++	],
++	"capabilities": [
++		"invoke"
++	],
++	"register": "filter",
++	"node": "python",
++	"path": "nodes.tool_step_back",
++	"prefix": "step_back",
++	"icon": "rocketride.svg",
++	"documentation": "https://docs.rocketride.org",
++	"description": [
++		"Take a small step BACKWARD. Perception recovery \u2014 never as defense.",
++		"Returns a structured action plan that the controller's FSM applies on the next step."
++	],
++	"tile": [
++		"Tool: step_back.execute"
++	],
++	"lanes": {},
++	"preconfig": {
++		"default": "default",
++		"profiles": {
++			"default": {
++				"title": "Default",
++				"serverName": "step_back"
++			}
++		}
++	},
++	"fields": {},
++	"shape": [
++		{
++			"section": "Pipe",
++			"title": "Step Back",
++			"properties": [
++				"type"
++			]
++		}
++	]
++}
+\ No newline at end of file
+diff --git a/nodes/src/nodes/tool_stop/IGlobal.py b/nodes/src/nodes/tool_stop/IGlobal.py
+new file mode 100644
+index 00000000..fd07e23f
+--- /dev/null
++++ b/nodes/src/nodes/tool_stop/IGlobal.py
+@@ -0,0 +1,8 @@
++"""tool stop — global (no shared state)."""
++from __future__ import annotations
++from rocketlib import IGlobalBase
++
++
++class IGlobal(IGlobalBase):
++    def beginGlobal(self) -> None:
++        return
+diff --git a/nodes/src/nodes/tool_stop/IInstance.py b/nodes/src/nodes/tool_stop/IInstance.py
+new file mode 100644
+index 00000000..0afb358c
+--- /dev/null
++++ b/nodes/src/nodes/tool_stop/IInstance.py
+@@ -0,0 +1,38 @@
++"""tool_stop — atomic skill emitting action STOP."""
++
++from __future__ import annotations
++
++from rocketlib import IInstanceBase, tool_function
++
++from .IGlobal import IGlobal
++
++
++class IInstance(IInstanceBase):
++    IGlobal: IGlobal
++
++    @tool_function(
++        input_schema={"type": "object", "properties": {"duration_ms": {"type": "integer", "default": 600, "description": "How long this action runs (ms)."}, "rationale": {"type": "string", "default": "", "description": "One short sentence reason."}}},
++        output_schema={"type": "object",
++                       "properties": {"action": {"type": "string"},
++                                      "params": {"type": "object"},
++                                      "duration_ms": {"type": "integer"},
++                                      "rationale": {"type": "string"}}},
++        description="Soccer robot atomic skill STOP: Stand still. Use to settle gait before kicking.",
++    )
++    def execute(self, args):
++        try:
++            import json as _j, time as _t
++            with open('/tmp/rocketride_debug.log', 'a') as _f:
++                _f.write(_j.dumps({'t': _t.strftime('%H:%M:%S.%f')[:-3],
++                    'src': 'tool_stop', 'event': 'execute', 'args': args},
++                    default=str) + '\n')
++        except Exception:
++            pass
++
++        params = {}
++        if not isinstance(args, dict):
++            args = {}
++        duration_ms = int(args.get("duration_ms", 600))
++        rationale = str(args.get("rationale", ""))
++        return {"action": "STOP", "params": params,
++                "duration_ms": duration_ms, "rationale": rationale}
+diff --git a/nodes/src/nodes/tool_stop/__init__.py b/nodes/src/nodes/tool_stop/__init__.py
+new file mode 100644
+index 00000000..dcb1324f
+--- /dev/null
++++ b/nodes/src/nodes/tool_stop/__init__.py
+@@ -0,0 +1,5 @@
++"""Tool stop package — atomic skill node."""
++from .IGlobal import IGlobal
++from .IInstance import IInstance
++
++__all__ = ['IGlobal', 'IInstance']
+diff --git a/nodes/src/nodes/tool_stop/services.json b/nodes/src/nodes/tool_stop/services.json
+new file mode 100644
+index 00000000..65b68a6a
+--- /dev/null
++++ b/nodes/src/nodes/tool_stop/services.json
+@@ -0,0 +1,43 @@
++{
++	"title": "Stop",
++	"protocol": "tool_stop://",
++	"classType": [
++		"tool"
++	],
++	"capabilities": [
++		"invoke"
++	],
++	"register": "filter",
++	"node": "python",
++	"path": "nodes.tool_stop",
++	"prefix": "stop",
++	"icon": "rocketride.svg",
++	"documentation": "https://docs.rocketride.org",
++	"description": [
++		"Stand still. Use to settle gait before kicking.",
++		"Returns a structured action plan that the controller's FSM applies on the next step."
++	],
++	"tile": [
++		"Tool: stop.execute"
++	],
++	"lanes": {},
++	"preconfig": {
++		"default": "default",
++		"profiles": {
++			"default": {
++				"title": "Default",
++				"serverName": "stop"
++			}
++		}
++	},
++	"fields": {},
++	"shape": [
++		{
++			"section": "Pipe",
++			"title": "Stop",
++			"properties": [
++				"type"
++			]
++		}
++	]
++}
+\ No newline at end of file
+diff --git a/nodes/src/nodes/tool_turn_left/IGlobal.py b/nodes/src/nodes/tool_turn_left/IGlobal.py
+new file mode 100644
+index 00000000..a502b2a3
+--- /dev/null
++++ b/nodes/src/nodes/tool_turn_left/IGlobal.py
+@@ -0,0 +1,8 @@
++"""tool turn_left — global (no shared state)."""
++from __future__ import annotations
++from rocketlib import IGlobalBase
++
++
++class IGlobal(IGlobalBase):
++    def beginGlobal(self) -> None:
++        return
+diff --git a/nodes/src/nodes/tool_turn_left/IInstance.py b/nodes/src/nodes/tool_turn_left/IInstance.py
+new file mode 100644
+index 00000000..139f4c9c
+--- /dev/null
++++ b/nodes/src/nodes/tool_turn_left/IInstance.py
+@@ -0,0 +1,38 @@
++"""tool_turn_left — atomic skill emitting action TURN_LEFT."""
++
++from __future__ import annotations
++
++from rocketlib import IInstanceBase, tool_function
++
++from .IGlobal import IGlobal
++
++
++class IInstance(IInstanceBase):
++    IGlobal: IGlobal
++
++    @tool_function(
++        input_schema={"type": "object", "properties": {"duration_ms": {"type": "integer", "default": 1500, "description": "How long this action runs (ms)."}, "rationale": {"type": "string", "default": "", "description": "One short sentence reason."}}},
++        output_schema={"type": "object",
++                       "properties": {"action": {"type": "string"},
++                                      "params": {"type": "object"},
++                                      "duration_ms": {"type": "integer"},
++                                      "rationale": {"type": "string"}}},
++        description="Soccer robot atomic skill TURN_LEFT: Rotate the body LEFT in place. Use for scanning or aligning.",
++    )
++    def execute(self, args):
++        try:
++            import json as _j, time as _t
++            with open('/tmp/rocketride_debug.log', 'a') as _f:
++                _f.write(_j.dumps({'t': _t.strftime('%H:%M:%S.%f')[:-3],
++                    'src': 'tool_turn_left', 'event': 'execute', 'args': args},
++                    default=str) + '\n')
++        except Exception:
++            pass
++
++        params = {}
++        if not isinstance(args, dict):
++            args = {}
++        duration_ms = int(args.get("duration_ms", 1500))
++        rationale = str(args.get("rationale", ""))
++        return {"action": "TURN_LEFT", "params": params,
++                "duration_ms": duration_ms, "rationale": rationale}
+diff --git a/nodes/src/nodes/tool_turn_left/__init__.py b/nodes/src/nodes/tool_turn_left/__init__.py
+new file mode 100644
+index 00000000..8f70968f
+--- /dev/null
++++ b/nodes/src/nodes/tool_turn_left/__init__.py
+@@ -0,0 +1,5 @@
++"""Tool turn_left package — atomic skill node."""
++from .IGlobal import IGlobal
++from .IInstance import IInstance
++
++__all__ = ['IGlobal', 'IInstance']
+diff --git a/nodes/src/nodes/tool_turn_left/services.json b/nodes/src/nodes/tool_turn_left/services.json
+new file mode 100644
+index 00000000..a562bdc7
+--- /dev/null
++++ b/nodes/src/nodes/tool_turn_left/services.json
+@@ -0,0 +1,43 @@
++{
++	"title": "Turn Left",
++	"protocol": "tool_turn_left://",
++	"classType": [
++		"tool"
++	],
++	"capabilities": [
++		"invoke"
++	],
++	"register": "filter",
++	"node": "python",
++	"path": "nodes.tool_turn_left",
++	"prefix": "turn_left",
++	"icon": "rocketride.svg",
++	"documentation": "https://docs.rocketride.org",
++	"description": [
++		"Rotate the body LEFT in place. Use for scanning or aligning.",
++		"Returns a structured action plan that the controller's FSM applies on the next step."
++	],
++	"tile": [
++		"Tool: turn_left.execute"
++	],
++	"lanes": {},
++	"preconfig": {
++		"default": "default",
++		"profiles": {
++			"default": {
++				"title": "Default",
++				"serverName": "turn_left"
++			}
++		}
++	},
++	"fields": {},
++	"shape": [
++		{
++			"section": "Pipe",
++			"title": "Turn Left",
++			"properties": [
++				"type"
++			]
++		}
++	]
++}
+\ No newline at end of file
+diff --git a/nodes/src/nodes/tool_turn_right/IGlobal.py b/nodes/src/nodes/tool_turn_right/IGlobal.py
+new file mode 100644
+index 00000000..e45e3eea
+--- /dev/null
++++ b/nodes/src/nodes/tool_turn_right/IGlobal.py
+@@ -0,0 +1,8 @@
++"""tool turn_right — global (no shared state)."""
++from __future__ import annotations
++from rocketlib import IGlobalBase
++
++
++class IGlobal(IGlobalBase):
++    def beginGlobal(self) -> None:
++        return
+diff --git a/nodes/src/nodes/tool_turn_right/IInstance.py b/nodes/src/nodes/tool_turn_right/IInstance.py
+new file mode 100644
+index 00000000..db39a4af
+--- /dev/null
++++ b/nodes/src/nodes/tool_turn_right/IInstance.py
+@@ -0,0 +1,38 @@
++"""tool_turn_right — atomic skill emitting action TURN_RIGHT."""
++
++from __future__ import annotations
++
++from rocketlib import IInstanceBase, tool_function
++
++from .IGlobal import IGlobal
++
++
++class IInstance(IInstanceBase):
++    IGlobal: IGlobal
++
++    @tool_function(
++        input_schema={"type": "object", "properties": {"duration_ms": {"type": "integer", "default": 1500, "description": "How long this action runs (ms)."}, "rationale": {"type": "string", "default": "", "description": "One short sentence reason."}}},
++        output_schema={"type": "object",
++                       "properties": {"action": {"type": "string"},
++                                      "params": {"type": "object"},
++                                      "duration_ms": {"type": "integer"},
++                                      "rationale": {"type": "string"}}},
++        description="Soccer robot atomic skill TURN_RIGHT: Rotate the body RIGHT in place.",
++    )
++    def execute(self, args):
++        try:
++            import json as _j, time as _t
++            with open('/tmp/rocketride_debug.log', 'a') as _f:
++                _f.write(_j.dumps({'t': _t.strftime('%H:%M:%S.%f')[:-3],
++                    'src': 'tool_turn_right', 'event': 'execute', 'args': args},
++                    default=str) + '\n')
++        except Exception:
++            pass
++
++        params = {}
++        if not isinstance(args, dict):
++            args = {}
++        duration_ms = int(args.get("duration_ms", 1500))
++        rationale = str(args.get("rationale", ""))
++        return {"action": "TURN_RIGHT", "params": params,
++                "duration_ms": duration_ms, "rationale": rationale}
+diff --git a/nodes/src/nodes/tool_turn_right/__init__.py b/nodes/src/nodes/tool_turn_right/__init__.py
+new file mode 100644
+index 00000000..da7001b9
+--- /dev/null
++++ b/nodes/src/nodes/tool_turn_right/__init__.py
+@@ -0,0 +1,5 @@
++"""Tool turn_right package — atomic skill node."""
++from .IGlobal import IGlobal
++from .IInstance import IInstance
++
++__all__ = ['IGlobal', 'IInstance']
+diff --git a/nodes/src/nodes/tool_turn_right/services.json b/nodes/src/nodes/tool_turn_right/services.json
+new file mode 100644
+index 00000000..0692897b
+--- /dev/null
++++ b/nodes/src/nodes/tool_turn_right/services.json
+@@ -0,0 +1,43 @@
++{
++	"title": "Turn Right",
++	"protocol": "tool_turn_right://",
++	"classType": [
++		"tool"
++	],
++	"capabilities": [
++		"invoke"
++	],
++	"register": "filter",
++	"node": "python",
++	"path": "nodes.tool_turn_right",
++	"prefix": "turn_right",
++	"icon": "rocketride.svg",
++	"documentation": "https://docs.rocketride.org",
++	"description": [
++		"Rotate the body RIGHT in place.",
++		"Returns a structured action plan that the controller's FSM applies on the next step."
++	],
++	"tile": [
++		"Tool: turn_right.execute"
++	],
++	"lanes": {},
++	"preconfig": {
++		"default": "default",
++		"profiles": {
++			"default": {
++				"title": "Default",
++				"serverName": "turn_right"
++			}
++		}
++	},
++	"fields": {},
++	"shape": [
++		{
++			"section": "Pipe",
++			"title": "Turn Right",
++			"properties": [
++				"type"
++			]
++		}
++	]
++}
+\ No newline at end of file
+diff --git a/nodes/src/nodes/tool_walk/IGlobal.py b/nodes/src/nodes/tool_walk/IGlobal.py
+new file mode 100644
+index 00000000..891381a7
+--- /dev/null
++++ b/nodes/src/nodes/tool_walk/IGlobal.py
+@@ -0,0 +1,8 @@
++"""tool_walk — global (no shared state needed)."""
++from __future__ import annotations
++from rocketlib import IGlobalBase
++
++
++class IGlobal(IGlobalBase):
++    def beginGlobal(self) -> None:
++        return
+diff --git a/nodes/src/nodes/tool_walk/IInstance.py b/nodes/src/nodes/tool_walk/IInstance.py
+new file mode 100644
+index 00000000..04b1adb6
+--- /dev/null
++++ b/nodes/src/nodes/tool_walk/IInstance.py
+@@ -0,0 +1,59 @@
++"""tool_walk — atomic walk-forward skill (test node)."""
++
++from __future__ import annotations
++
++from rocketlib import IInstanceBase, tool_function
++
++from .IGlobal import IGlobal
++
++
++class IInstance(IInstanceBase):
++    IGlobal: IGlobal
++
++    @tool_function(
++        input_schema={
++            "type": "object",
++            "properties": {
++                "rationale": {
++                    "type": "string", "default": "",
++                    "description": "Why we are walking.",
++                },
++            },
++        },
++        output_schema={
++            "type": "object",
++            "properties": {
++                "action": {"type": "string"},
++                "params": {"type": "object"},
++                "duration_ms": {"type": "integer"},
++                "rationale": {"type": "string"},
++            },
++        },
++        description=(
++            "Soccer robot atomic skill WALK: walk forward for 2 seconds. "
++            "Always call this tool every turn."
++        ),
++    )
++    def execute(self, args):
++        # Audit log so we can verify the node actually runs.
++        try:
++            import json
++            import os
++            import time
++            with open("/tmp/rocketride_tool_walk.log", "a", encoding="utf-8") as f:
++                f.write(json.dumps({
++                    "t": time.strftime("%H:%M:%S"),
++                    "pid": os.getpid(),
++                    "args": args,
++                }) + "\n")
++        except Exception:
++            pass
++        rationale = ""
++        if isinstance(args, dict):
++            rationale = str(args.get("rationale", ""))
++        return {
++            "action": "WALK",
++            "params": {},
++            "duration_ms": 2000,
++            "rationale": rationale,
++        }
+diff --git a/nodes/src/nodes/tool_walk/__init__.py b/nodes/src/nodes/tool_walk/__init__.py
+new file mode 100644
+index 00000000..929c5288
+--- /dev/null
++++ b/nodes/src/nodes/tool_walk/__init__.py
+@@ -0,0 +1,6 @@
++"""Tool walk package — atomic walk-forward skill."""
++
++from .IGlobal import IGlobal
++from .IInstance import IInstance
++
++__all__ = ['IGlobal', 'IInstance']
+diff --git a/nodes/src/nodes/tool_walk/services.json b/nodes/src/nodes/tool_walk/services.json
+new file mode 100644
+index 00000000..9b8359a8
+--- /dev/null
++++ b/nodes/src/nodes/tool_walk/services.json
+@@ -0,0 +1,28 @@
++{
++	"title": "Walk",
++	"protocol": "tool_walk://",
++	"classType": ["tool"],
++	"capabilities": ["invoke"],
++	"register": "filter",
++	"node": "python",
++	"path": "nodes.tool_walk",
++	"prefix": "walk",
++	"icon": "rocketride.svg",
++	"documentation": "https://docs.rocketride.org",
++	"description": [
++		"Soccer robot atomic skill: walk forward for 2 seconds.",
++		"Returns a structured action plan that the controller's FSM applies on the next step."
++	],
++	"tile": ["Tool: walk.execute"],
++	"lanes": {},
++	"preconfig": {
++		"default": "default",
++		"profiles": {
++			"default": { "title": "Default", "serverName": "walk" }
++		}
++	},
++	"fields": {},
++	"shape": [
++		{ "section": "Pipe", "title": "Walk", "properties": ["type"] }
++	]
++}
+diff --git a/nodes/src/nodes/tool_walk_arc_left/IGlobal.py b/nodes/src/nodes/tool_walk_arc_left/IGlobal.py
+new file mode 100644
+index 00000000..fcba035d
+--- /dev/null
++++ b/nodes/src/nodes/tool_walk_arc_left/IGlobal.py
+@@ -0,0 +1,8 @@
++"""tool walk_arc_left — global (no shared state)."""
++from __future__ import annotations
++from rocketlib import IGlobalBase
++
++
++class IGlobal(IGlobalBase):
++    def beginGlobal(self) -> None:
++        return
+diff --git a/nodes/src/nodes/tool_walk_arc_left/IInstance.py b/nodes/src/nodes/tool_walk_arc_left/IInstance.py
+new file mode 100644
+index 00000000..df243724
+--- /dev/null
++++ b/nodes/src/nodes/tool_walk_arc_left/IInstance.py
+@@ -0,0 +1,38 @@
++"""tool_walk_arc_left — atomic skill emitting action WALK_ARC_LEFT."""
++
++from __future__ import annotations
++
++from rocketlib import IInstanceBase, tool_function
++
++from .IGlobal import IGlobal
++
++
++class IInstance(IInstanceBase):
++    IGlobal: IGlobal
++
++    @tool_function(
++        input_schema={"type": "object", "properties": {"duration_ms": {"type": "integer", "default": 2500, "description": "How long this action runs (ms)."}, "rationale": {"type": "string", "default": "", "description": "One short sentence reason."}}},
++        output_schema={"type": "object",
++                       "properties": {"action": {"type": "string"},
++                                      "params": {"type": "object"},
++                                      "duration_ms": {"type": "integer"},
++                                      "rationale": {"type": "string"}}},
++        description="Soccer robot atomic skill WALK_ARC_LEFT: Walk forward while curving LEFT. Cheaper than turn+walk.",
++    )
++    def execute(self, args):
++        try:
++            import json as _j, time as _t
++            with open('/tmp/rocketride_debug.log', 'a') as _f:
++                _f.write(_j.dumps({'t': _t.strftime('%H:%M:%S.%f')[:-3],
++                    'src': 'tool_walk_arc_left', 'event': 'execute', 'args': args},
++                    default=str) + '\n')
++        except Exception:
++            pass
++
++        params = {}
++        if not isinstance(args, dict):
++            args = {}
++        duration_ms = int(args.get("duration_ms", 2500))
++        rationale = str(args.get("rationale", ""))
++        return {"action": "WALK_ARC_LEFT", "params": params,
++                "duration_ms": duration_ms, "rationale": rationale}
+diff --git a/nodes/src/nodes/tool_walk_arc_left/__init__.py b/nodes/src/nodes/tool_walk_arc_left/__init__.py
+new file mode 100644
+index 00000000..302b522d
+--- /dev/null
++++ b/nodes/src/nodes/tool_walk_arc_left/__init__.py
+@@ -0,0 +1,5 @@
++"""Tool walk_arc_left package — atomic skill node."""
++from .IGlobal import IGlobal
++from .IInstance import IInstance
++
++__all__ = ['IGlobal', 'IInstance']
+diff --git a/nodes/src/nodes/tool_walk_arc_left/services.json b/nodes/src/nodes/tool_walk_arc_left/services.json
+new file mode 100644
+index 00000000..6823f5a8
+--- /dev/null
++++ b/nodes/src/nodes/tool_walk_arc_left/services.json
+@@ -0,0 +1,43 @@
++{
++	"title": "Walk Arc Left",
++	"protocol": "tool_walk_arc_left://",
++	"classType": [
++		"tool"
++	],
++	"capabilities": [
++		"invoke"
++	],
++	"register": "filter",
++	"node": "python",
++	"path": "nodes.tool_walk_arc_left",
++	"prefix": "walk_arc_left",
++	"icon": "rocketride.svg",
++	"documentation": "https://docs.rocketride.org",
++	"description": [
++		"Walk forward while curving LEFT. Cheaper than turn+walk.",
++		"Returns a structured action plan that the controller's FSM applies on the next step."
++	],
++	"tile": [
++		"Tool: walk_arc_left.execute"
++	],
++	"lanes": {},
++	"preconfig": {
++		"default": "default",
++		"profiles": {
++			"default": {
++				"title": "Default",
++				"serverName": "walk_arc_left"
++			}
++		}
++	},
++	"fields": {},
++	"shape": [
++		{
++			"section": "Pipe",
++			"title": "Walk Arc Left",
++			"properties": [
++				"type"
++			]
++		}
++	]
++}
+\ No newline at end of file
+diff --git a/nodes/src/nodes/tool_walk_arc_right/IGlobal.py b/nodes/src/nodes/tool_walk_arc_right/IGlobal.py
+new file mode 100644
+index 00000000..0b56b222
+--- /dev/null
++++ b/nodes/src/nodes/tool_walk_arc_right/IGlobal.py
+@@ -0,0 +1,8 @@
++"""tool walk_arc_right — global (no shared state)."""
++from __future__ import annotations
++from rocketlib import IGlobalBase
++
++
++class IGlobal(IGlobalBase):
++    def beginGlobal(self) -> None:
++        return
+diff --git a/nodes/src/nodes/tool_walk_arc_right/IInstance.py b/nodes/src/nodes/tool_walk_arc_right/IInstance.py
+new file mode 100644
+index 00000000..c619c1cb
+--- /dev/null
++++ b/nodes/src/nodes/tool_walk_arc_right/IInstance.py
+@@ -0,0 +1,38 @@
++"""tool_walk_arc_right — atomic skill emitting action WALK_ARC_RIGHT."""
++
++from __future__ import annotations
++
++from rocketlib import IInstanceBase, tool_function
++
++from .IGlobal import IGlobal
++
++
++class IInstance(IInstanceBase):
++    IGlobal: IGlobal
++
++    @tool_function(
++        input_schema={"type": "object", "properties": {"duration_ms": {"type": "integer", "default": 2500, "description": "How long this action runs (ms)."}, "rationale": {"type": "string", "default": "", "description": "One short sentence reason."}}},
++        output_schema={"type": "object",
++                       "properties": {"action": {"type": "string"},
++                                      "params": {"type": "object"},
++                                      "duration_ms": {"type": "integer"},
++                                      "rationale": {"type": "string"}}},
++        description="Soccer robot atomic skill WALK_ARC_RIGHT: Walk forward while curving RIGHT.",
++    )
++    def execute(self, args):
++        try:
++            import json as _j, time as _t
++            with open('/tmp/rocketride_debug.log', 'a') as _f:
++                _f.write(_j.dumps({'t': _t.strftime('%H:%M:%S.%f')[:-3],
++                    'src': 'tool_walk_arc_right', 'event': 'execute', 'args': args},
++                    default=str) + '\n')
++        except Exception:
++            pass
++
++        params = {}
++        if not isinstance(args, dict):
++            args = {}
++        duration_ms = int(args.get("duration_ms", 2500))
++        rationale = str(args.get("rationale", ""))
++        return {"action": "WALK_ARC_RIGHT", "params": params,
++                "duration_ms": duration_ms, "rationale": rationale}
+diff --git a/nodes/src/nodes/tool_walk_arc_right/__init__.py b/nodes/src/nodes/tool_walk_arc_right/__init__.py
+new file mode 100644
+index 00000000..44164b68
+--- /dev/null
++++ b/nodes/src/nodes/tool_walk_arc_right/__init__.py
+@@ -0,0 +1,5 @@
++"""Tool walk_arc_right package — atomic skill node."""
++from .IGlobal import IGlobal
++from .IInstance import IInstance
++
++__all__ = ['IGlobal', 'IInstance']
+diff --git a/nodes/src/nodes/tool_walk_arc_right/services.json b/nodes/src/nodes/tool_walk_arc_right/services.json
+new file mode 100644
+index 00000000..695700f7
+--- /dev/null
++++ b/nodes/src/nodes/tool_walk_arc_right/services.json
+@@ -0,0 +1,43 @@
++{
++	"title": "Walk Arc Right",
++	"protocol": "tool_walk_arc_right://",
++	"classType": [
++		"tool"
++	],
++	"capabilities": [
++		"invoke"
++	],
++	"register": "filter",
++	"node": "python",
++	"path": "nodes.tool_walk_arc_right",
++	"prefix": "walk_arc_right",
++	"icon": "rocketride.svg",
++	"documentation": "https://docs.rocketride.org",
++	"description": [
++		"Walk forward while curving RIGHT.",
++		"Returns a structured action plan that the controller's FSM applies on the next step."
++	],
++	"tile": [
++		"Tool: walk_arc_right.execute"
++	],
++	"lanes": {},
++	"preconfig": {
++		"default": "default",
++		"profiles": {
++			"default": {
++				"title": "Default",
++				"serverName": "walk_arc_right"
++			}
++		}
++	},
++	"fields": {},
++	"shape": [
++		{
++			"section": "Pipe",
++			"title": "Walk Arc Right",
++			"properties": [
++				"type"
++			]
++		}
++	]
++}
+\ No newline at end of file
+diff --git a/nodes/test/flow/conftest.py b/nodes/test/flow/conftest.py
+new file mode 100644
+index 00000000..2f5b4067
+--- /dev/null
++++ b/nodes/test/flow/conftest.py
+@@ -0,0 +1,125 @@
++# =============================================================================
++# MIT License
++# Copyright (c) 2026 Aparavi Software AG
++# =============================================================================
++"""Test setup for flow_* unit tests.
++
++Adds `nodes/src` to `sys.path` and stubs the engine modules
++(`rocketlib`, `ai.common.config`, `ai.common.schema`) so the new
++`flow.base` / `flow.pyeval` / `flow.llm` packages are importable
++without the engine runtime.
++"""
++
++from __future__ import annotations
++
++import sys
++import types
++from pathlib import Path
++
++_NODES_SRC = Path(__file__).resolve().parent.parent.parent / 'src'
++if str(_NODES_SRC) not in sys.path:
++    sys.path.insert(0, str(_NODES_SRC))
++
++
++def _install_depends_stub() -> None:
++    if 'depends' in sys.modules:
++        return
++    stub = types.ModuleType('depends')
++    stub.depends = lambda *_args, **_kwargs: None
++    sys.modules['depends'] = stub
++
++
++def _install_rocketlib_stub() -> None:
++    if 'rocketlib' in sys.modules:
++        return
++
++    rocketlib = types.ModuleType('rocketlib')
++
++    class _IInstanceBase:
++        IGlobal = None
++        IEndpoint = None
++        instance = None
++
++        def preventDefault(self):
++            raise _PreventDefault()
++
++    class _IGlobalBase:
++        IEndpoint = None
++        glb = None
++
++    class _OpenMode:
++        CONFIG = 'CONFIG'
++        RUN = 'RUN'
++
++    class _AviAction:
++        BEGIN = 0
++        WRITE = 1
++        END = 2
++
++    class _PreventDefault(Exception):
++        pass
++
++    rocketlib.IInstanceBase = _IInstanceBase
++    rocketlib.IGlobalBase = _IGlobalBase
++    rocketlib.OPEN_MODE = _OpenMode
++    rocketlib.AVI_ACTION = _AviAction
++    sys.modules['rocketlib'] = rocketlib
++
++    # rocketlib.types
++    rl_types = types.ModuleType('rocketlib.types')
++
++    class _IInvokeLLM:
++        class Ask:
++            def __init__(self, question):
++                self.question = question
++                self.answer = None  # tests populate this
++
++    rl_types.IInvokeLLM = _IInvokeLLM
++    sys.modules['rocketlib.types'] = rl_types
++
++
++def _install_ai_common_stubs() -> None:
++    if 'ai' not in sys.modules:
++        ai = types.ModuleType('ai')
++        ai_common = types.ModuleType('ai.common')
++        ai_common_config = types.ModuleType('ai.common.config')
++        ai_common_schema = types.ModuleType('ai.common.schema')
++
++        class _Config:
++            @staticmethod
++            def getNodeConfig(*_args, **_kwargs) -> dict:
++                return {}
++
++        class _Question:
++            def __init__(self):
++                self.context = []
++                self.questions = []
++
++            def addContext(self, value):
++                self.context.append(value)
++
++            def addQuestion(self, value):
++                self.questions.append(value)
++
++        class _Answer:
++            def __init__(self, text=''):
++                self._text = text
++
++            def getText(self):
++                return self._text
++
++        ai_common_config.Config = _Config
++        ai_common_schema.Question = _Question
++        ai_common_schema.Answer = _Answer
++        ai.common = ai_common
++        ai_common.config = ai_common_config
++        ai_common.schema = ai_common_schema
++        sys.modules['ai'] = ai
++        sys.modules['ai.common'] = ai_common
++        sys.modules['ai.common.config'] = ai_common_config
++        sys.modules['ai.common.schema'] = ai_common_schema
++
++
++_install_depends_stub()
++_install_rocketlib_stub()
++_install_ai_common_stubs()
+diff --git a/nodes/test/flow/test_llm_check_condition.py b/nodes/test/flow/test_llm_check_condition.py
+new file mode 100644
+index 00000000..5bb19824
+--- /dev/null
++++ b/nodes/test/flow/test_llm_check_condition.py
+@@ -0,0 +1,148 @@
++# =============================================================================
++# MIT License
++# Copyright (c) 2026 Aparavi Software AG
++# =============================================================================
++"""Unit tests for `flow.llm.IInstance.checkCondition`.
++
++The LLM flow delegates the routing decision to a wired LLM via the
++control plane. We stub the engine instance so each test injects a
++canned LLM response, then verify the YES/NO parsing and fail-closed
++behavior.
++"""
++
++from __future__ import annotations
++
++from typing import List, Optional
++
++import pytest
++
++from nodes.flow_llm.IInstance import IInstance
++
++
++class _FakeAnswer:
++    def __init__(self, text: str):
++        self._text = text
++
++    def getText(self) -> str:
++        return self._text
++
++
++class _FakeEngineInstance:
++    """Minimal stub that records invoke calls and returns a canned answer."""
++
++    def __init__(
++        self,
++        llm_node_ids: Optional[List[str]] = None,
++        answer_text: str = 'YES',
++        raise_on_invoke: Optional[Exception] = None,
++    ):
++        self._llm_node_ids = llm_node_ids if llm_node_ids is not None else ['llm_1']
++        self._answer_text = answer_text
++        self._raise_on_invoke = raise_on_invoke
++        self.invoke_calls: List[dict] = []
++
++    def getControllerNodeIds(self, classType: str) -> List[str]:
++        if classType == 'llm':
++            return list(self._llm_node_ids)
++        return []
++
++    def invoke(self, param, component_id: str = '') -> None:
++        self.invoke_calls.append({'param': param, 'component_id': component_id})
++        if self._raise_on_invoke is not None:
++            raise self._raise_on_invoke
++        param.answer = _FakeAnswer(self._answer_text)
++
++
++def _build(engine_instance: _FakeEngineInstance) -> IInstance:
++    inst = IInstance.__new__(IInstance)
++    inst.IGlobal = None
++    inst.instance = engine_instance
++    return inst
++
++
++class TestYesNoParsing:
++    @pytest.mark.parametrize(
++        'answer_text, expected',
++        [
++            ('YES', True),
++            ('Yes', True),
++            ('yes', True),
++            ('YES.', True),
++            ('Yes!', True),
++            ('  yes  ', True),
++            ('"YES"', True),
++            ('Yes, definitely', True),
++            ('NO', False),
++            ('No', False),
++            ('Nope', False),
++            ('Unknown', False),
++            ('', False),
++            ('I cannot answer this question', False),
++        ],
++    )
++    def test_parse(self, answer_text, expected):
++        inst = _build(_FakeEngineInstance(answer_text=answer_text))
++        assert inst.checkCondition('Is there a dog?', text='hi') is expected
++
++
++class TestFailClosed:
++    def test_no_llm_wired(self):
++        inst = _build(_FakeEngineInstance(llm_node_ids=[]))
++        assert inst.checkCondition('Is there a dog?', text='hi') is False
++
++    def test_multiple_llms_wired(self):
++        inst = _build(_FakeEngineInstance(llm_node_ids=['llm_1', 'llm_2']))
++        assert inst.checkCondition('Is there a dog?', text='hi') is False
++
++    def test_invoke_raises(self):
++        inst = _build(_FakeEngineInstance(raise_on_invoke=RuntimeError('rate limit')))
++        assert inst.checkCondition('Is there a dog?', text='hi') is False
++
++    def test_empty_question(self):
++        inst = _build(_FakeEngineInstance())
++        assert inst.checkCondition('') is False
++
++    def test_whitespace_question(self):
++        inst = _build(_FakeEngineInstance())
++        assert inst.checkCondition('   ') is False
++
++
++class TestPayloadShaping:
++    def test_text_chunk_inline(self):
++        engine = _FakeEngineInstance(answer_text='YES')
++        inst = _build(engine)
++        inst.checkCondition('Is this Spanish?', text='hola mundo')
++        assert engine.invoke_calls, 'invoke should have been called'
++        question = engine.invoke_calls[0]['param'].question
++        assert 'hola mundo' in question.context
++
++    def test_image_chunk_as_data_url(self):
++        engine = _FakeEngineInstance(answer_text='YES')
++        inst = _build(engine)
++        inst.checkCondition(
++            'Is there a dog?',
++            image=b'\x89PNGfake',
++            mimeType='image/png',
++        )
++        question = engine.invoke_calls[0]['param'].question
++        data_urls = [c for c in question.context if isinstance(c, str) and c.startswith('data:image/png;base64,')]
++        assert data_urls, f'expected an image data URL in contexts, got {question.context!r}'
++
++    def test_streaming_metadata_skipped(self):
++        """`mimeType` and `action` are streaming metadata, not content —
++        they should not appear as standalone context entries.
++        """
++        engine = _FakeEngineInstance(answer_text='NO')
++        inst = _build(engine)
++        inst.checkCondition(
++            'Is this PNG?',
++            image=b'\x89PNGfake',
++            mimeType='image/png',
++            action=2,  # END
++        )
++        question = engine.invoke_calls[0]['param'].question
++        # mimeType should NOT appear as a raw context line.
++        for c in question.context:
++            assert c != 'image/png', 'mimeType should not be a context entry on its own'
++            # action also shouldn't appear standalone.
++            assert c != '2'
+diff --git a/nodes/test/flow/test_pyeval_check_condition.py b/nodes/test/flow/test_pyeval_check_condition.py
+new file mode 100644
+index 00000000..b7b22de5
+--- /dev/null
++++ b/nodes/test/flow/test_pyeval_check_condition.py
+@@ -0,0 +1,151 @@
++# =============================================================================
++# MIT License
++# Copyright (c) 2026 Aparavi Software AG
++# =============================================================================
++"""Unit tests for `flow.pyeval.IInstance.checkCondition`.
++
++The pyeval flow's job is to safely evaluate a Python expression against
++the active lane payload + the current entry. These tests exercise the
++sandbox boundary and the fail-closed behaviour without needing the
++engine runtime.
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from nodes.flow_pyeval.IInstance import IInstance
++
++
++def _build():
++    """Construct a bare IInstance with no engine context."""
++    inst = IInstance.__new__(IInstance)
++    inst.IGlobal = None
++    inst.instance = None
++    return inst
++
++
++class TestBasicEvaluation:
++    def test_literal_true(self):
++        inst = _build()
++        assert inst.checkCondition('True') is True
++
++    def test_literal_false(self):
++        inst = _build()
++        assert inst.checkCondition('False') is False
++
++    def test_arithmetic(self):
++        inst = _build()
++        assert inst.checkCondition('1 + 2 == 3') is True
++
++    def test_lane_binding(self):
++        inst = _build()
++        assert inst.checkCondition("'foo' in text", text='hello foo bar') is True
++        assert inst.checkCondition("'baz' in text", text='hello foo bar') is False
++
++    def test_byte_level_image_check(self):
++        inst = _build()
++        assert (
++            inst.checkCondition(
++                "image[:4] == b'\\x89PNG'",
++                image=b'\x89PNG\r\n\x1a\nrest',
++            )
++            is True
++        )
++        assert (
++            inst.checkCondition(
++                "image[:4] == b'\\x89PNG'",
++                image=b'\xff\xd8\xff\xe0jpeg',
++            )
++            is False
++        )
++
++    def test_len_on_bytes(self):
++        inst = _build()
++        assert inst.checkCondition('len(image) > 100', image=b'x' * 200) is True
++        assert inst.checkCondition('len(image) > 100', image=b'x' * 50) is False
++
++    def test_or_across_lanes_no_nameerror(self):
++        """Each evaluation only binds the lanes the call provides; a
++        condition that references an unbound lane should fail-closed
++        rather than crash. Best practice is to bind defaults — but the
++        sandbox should at minimum not propagate.
++        """
++        inst = _build()
++        # `text` is bound, `table` is not — `table` reference should
++        # return False (fail-closed) without raising.
++        assert inst.checkCondition("'foo' in table", text='foo') is False
++
++
++class TestSandboxRejections:
++    @pytest.mark.parametrize(
++        'expr',
++        [
++            'import os',
++            '__import__("os")',
++            'x.__class__',
++            'x._private',
++            'eval("1")',
++            'exec("x=1")',
++        ],
++    )
++    def test_rejects_dangerous_constructs(self, expr):
++        inst = _build()
++        # All of these should fail-closed (return False) rather than crash.
++        assert inst.checkCondition(expr, x=1) is False
++
++    def test_empty_condition(self):
++        inst = _build()
++        assert inst.checkCondition('') is False
++
++    def test_whitespace_only(self):
++        inst = _build()
++        assert inst.checkCondition('   ') is False
++
++    def test_syntax_error(self):
++        inst = _build()
++        assert inst.checkCondition('1 +') is False
++
++    def test_runtime_error(self):
++        inst = _build()
++        assert inst.checkCondition('1 / 0') is False
++
++    def test_leading_whitespace_is_stripped(self):
++        """`ast.parse(mode='eval')` rejects leading whitespace as
++        indentation; the driver must strip before parsing so accidental
++        copy-paste spaces don't break valid expressions.
++        """
++        inst = _build()
++        assert inst.checkCondition('  True  ') is True
++
++
++class TestSafeBuiltins:
++    def test_len_available(self):
++        inst = _build()
++        assert inst.checkCondition('len("abc") == 3') is True
++
++    def test_int_from_bytes_for_png_dimensions(self):
++        """`int.from_bytes` is reachable for byte-level PNG header parsing."""
++        inst = _build()
++        # PNG width is at bytes 16-19 (big-endian uint32). 0x00000064 = 100.
++        png_bytes = (
++            b'\x89PNG\r\n\x1a\n'  # 8-byte signature
++            + b'\x00\x00\x00\x0d'  # IHDR chunk length
++            + b'IHDR'  # chunk type
++            + b'\x00\x00\x00\x64'  # width = 100
++            + b'\x00\x00\x00\x32'  # height = 50
++            + b'\x08\x02\x00\x00\x00'  # bit depth + color + ...
++        )
++        assert (
++            inst.checkCondition(
++                "int.from_bytes(image[16:20], 'big') == 100",
++                image=png_bytes,
++            )
++            is True
++        )
++
++    def test_dangerous_builtin_absent(self):
++        inst = _build()
++        # `eval` is not in the safe builtins, so calling it raises
++        # NameError → caught → fail-closed.
++        assert inst.checkCondition('eval("1")') is False

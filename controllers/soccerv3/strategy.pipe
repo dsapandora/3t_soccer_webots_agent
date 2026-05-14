@@ -1,0 +1,456 @@
+{
+  "components": [
+    {
+      "id": "chat_1",
+      "provider": "webhook",
+      "name": "World Snapshot Input",
+      "config": {
+        "hideForm": true,
+        "mode": "Source",
+        "parameters": {},
+        "type": "webhook"
+      },
+      "ui": {
+        "position": {
+          "x": -10,
+          "y": 80
+        },
+        "nodeType": "default",
+        "formDataValid": true
+      }
+    },
+    {
+      "id": "agent_strategist_1",
+      "provider": "agent_rocketride",
+      "name": "Strategist",
+      "config": {
+        "profile": "default",
+        "default": {
+          "agent_description": "You are a striker on a Webots ROBOTIS-OP2 robot. You drive every movement explicitly via atomic skill tools.",
+          "instructions": [
+            "ROLE: You drive a soccer robot. The robot stands still until you give a command. Every movement is your call.",
+            "ATOMIC SKILLS (each is one tool — pick exactly ONE per turn):",
+            "  - walk.execute(duration_ms, rationale): walk straight forward.",
+            "  - turn_left.execute(duration_ms, rationale): rotate body LEFT in place.",
+            "  - turn_right.execute(duration_ms, rationale): rotate body RIGHT in place.",
+            "  - step_back.execute(duration_ms, rationale): small backstep — perception recovery only.",
+            "  - sidestep_left.execute(duration_ms, rationale): strafe LEFT, body still facing forward.",
+            "  - sidestep_right.execute(duration_ms, rationale): strafe RIGHT.",
+            "  - walk_arc_left.execute(duration_ms, rationale): walk forward + curve LEFT.",
+            "  - walk_arc_right.execute(duration_ms, rationale): walk forward + curve RIGHT.",
+            "  - look.execute(direction, rationale): direction='down'|'up'|'left'|'right'|'center'. Moves only head/neck. ~900ms.",
+            "  - kick.execute(side, rationale): side='left'|'right'. Use ONLY when ball is at your feet AND aligned.",
+            "  - stop.execute(duration_ms, rationale): stand still — settle gait before kicking.",
+            "  - celebrate.execute(rationale): hello/celebration motion.",
+            "WORLD STATE FROM SNAPSHOT (only field that matters: ball.x and ball.y):",
+            "  ball.x in [-1,+1]: position in the camera frame horizontally. -1=far left, 0=centered, +1=far right.",
+            "  ball.y in [-1,+1]: position in the camera frame vertically. -1=top of frame=ball is FAR, +1=bottom of frame=ball is at the robot's feet.",
+            "  goal.x in [-1,+1]. near_line:yes if you're on a field line.",
+            "  ⚠️ IGNORE ball_dist_est — it's an unreliable proxy. Use ONLY ball.y for distance.",
+            "DECISION TREE — strict order, evaluate each step in order, stop at first match:",
+            "  STEP 1. Ball not visible → look.execute(direction='down'). If just looked down, look(left), then look(right), then look(up). Last resort: turn_left.execute(duration_ms=2000).",
+            "  STEP 2. Ball NOT centered (|ball.x| > 0.30) → turn_left (if ball.x<0) or turn_right (if ball.x>0). duration_ms=800-1200ms. NEVER kick when ball is off-center.",
+            "  STEP 3. Ball centered AND ball.y < -0.2 (ball near horizon = VERY FAR) → walk.execute(duration_ms=7000-8000).",
+            "  STEP 4. Ball centered AND ball.y in [-0.2, 0.3) (medium) → walk.execute(duration_ms=4000-5000).",
+            "  STEP 5. Ball centered AND ball.y in [0.3, 0.7) (close, but NOT yet at feet) → walk.execute(duration_ms=1500-2000).",
+            "  STEP 6. Ball centered AND ball.y >= 0.85 (literally at the bottom of the frame = at the feet) → stop.execute(duration_ms=500), and on the NEXT turn kick.execute(side='left' if goal.x<0 else 'right').",
+            "  STEP 7. Ball was at feet last turn (y>=0.85) AND now invisible → celebrate.execute.",
+            "DURATION RULE — scale with ball.y (vertical position):",
+            "  • Each replan costs ~13s of LLM latency. Don't pick 2000ms for a far target — pick 6000-8000ms so the robot covers ground without pauses.",
+            "  • Heuristic: walk duration_ms ≈ (1 - max(ball.y, 0)) * 8000. So ball.y=-0.5 → 8000ms, ball.y=0 → 8000ms, ball.y=+0.4 → 4800ms, ball.y=+0.7 → 2400ms.",
+            "  • Turns and look: 800-1500ms.",
+            "KICK PRECONDITION — HARD RULE (never break):",
+            "  • ONLY kick when BOTH: ball.y >= 0.85 (truly at feet) AND |ball.x| <= 0.20 (well centered).",
+            "  • If either fails, do NOT kick. Turn or walk first.",
+            "PROTOCOL — IMPORTANT:",
+            "  • Each turn: call exactly ONE tool. The tool returns {action,params,duration_ms,rationale}.",
+            "  • Then emit {\"done\": true, \"answer\": <the tool's JSON, as a STRING>} to end the wave.",
+            "  • One sentence rationale citing numeric values you observed."
+          ],
+          "max_waves": 3
+        }
+      },
+      "ui": {
+        "position": {
+          "x": 290,
+          "y": 110
+        },
+        "nodeType": "default",
+        "formDataValid": true
+      },
+      "input": [
+        {
+          "lane": "questions",
+          "from": "chat_1"
+        }
+      ]
+    },
+    {
+      "id": "llm_anthropic_1",
+      "provider": "llm_anthropic",
+      "name": "Claude Haiku",
+      "config": {
+        "profile": "claude-haiku-4-5",
+        "claude-haiku-4-5": {
+          "apikey": "${ROCKETRIDE_ANTHROPIC_KEY}"
+        },
+        "parameters": {}
+      },
+      "ui": {
+        "position": {
+          "x": 10,
+          "y": 340
+        },
+        "nodeType": "default",
+        "formDataValid": true
+      },
+      "control": [
+        {
+          "classType": "llm",
+          "from": "agent_strategist_1"
+        }
+      ]
+    },
+    {
+      "id": "memory_internal_1",
+      "provider": "memory_internal",
+      "name": "Memory",
+      "config": {
+        "type": "memory_internal"
+      },
+      "ui": {
+        "position": {
+          "x": 240,
+          "y": 330
+        },
+        "nodeType": "default",
+        "formDataValid": true
+      },
+      "control": [
+        {
+          "classType": "memory",
+          "from": "agent_strategist_1"
+        }
+      ]
+    },
+    {
+      "id": "walk",
+      "provider": "tool_walk",
+      "name": "Walk",
+      "config": {
+        "type": "tool_walk",
+        "profile": "default",
+        "serverName": "walk"
+      },
+      "ui": {
+        "position": {
+          "x": 640,
+          "y": 60
+        },
+        "nodeType": "default",
+        "formDataValid": true
+      },
+      "control": [
+        {
+          "classType": "tool",
+          "from": "agent_strategist_1"
+        }
+      ]
+    },
+    {
+      "id": "turn_left",
+      "provider": "tool_turn_left",
+      "name": "Turn Left",
+      "config": {
+        "type": "tool_turn_left",
+        "profile": "default",
+        "serverName": "turn_left"
+      },
+      "ui": {
+        "position": {
+          "x": 640,
+          "y": 130
+        },
+        "nodeType": "default",
+        "formDataValid": true
+      },
+      "control": [
+        {
+          "classType": "tool",
+          "from": "agent_strategist_1"
+        }
+      ]
+    },
+    {
+      "id": "turn_right",
+      "provider": "tool_turn_right",
+      "name": "Turn Right",
+      "config": {
+        "type": "tool_turn_right",
+        "profile": "default",
+        "serverName": "turn_right"
+      },
+      "ui": {
+        "position": {
+          "x": 640,
+          "y": 200
+        },
+        "nodeType": "default",
+        "formDataValid": true
+      },
+      "control": [
+        {
+          "classType": "tool",
+          "from": "agent_strategist_1"
+        }
+      ]
+    },
+    {
+      "id": "step_back",
+      "provider": "tool_step_back",
+      "name": "Step Back",
+      "config": {
+        "type": "tool_step_back",
+        "profile": "default",
+        "serverName": "step_back"
+      },
+      "ui": {
+        "position": {
+          "x": 640,
+          "y": 270
+        },
+        "nodeType": "default",
+        "formDataValid": true
+      },
+      "control": [
+        {
+          "classType": "tool",
+          "from": "agent_strategist_1"
+        }
+      ]
+    },
+    {
+      "id": "sidestep_left",
+      "provider": "tool_sidestep_left",
+      "name": "Sidestep Left",
+      "config": {
+        "type": "tool_sidestep_left",
+        "profile": "default",
+        "serverName": "sidestep_left"
+      },
+      "ui": {
+        "position": {
+          "x": 640,
+          "y": 340
+        },
+        "nodeType": "default",
+        "formDataValid": true
+      },
+      "control": [
+        {
+          "classType": "tool",
+          "from": "agent_strategist_1"
+        }
+      ]
+    },
+    {
+      "id": "sidestep_right",
+      "provider": "tool_sidestep_right",
+      "name": "Sidestep Right",
+      "config": {
+        "type": "tool_sidestep_right",
+        "profile": "default",
+        "serverName": "sidestep_right"
+      },
+      "ui": {
+        "position": {
+          "x": 640,
+          "y": 410
+        },
+        "nodeType": "default",
+        "formDataValid": true
+      },
+      "control": [
+        {
+          "classType": "tool",
+          "from": "agent_strategist_1"
+        }
+      ]
+    },
+    {
+      "id": "walk_arc_left",
+      "provider": "tool_walk_arc_left",
+      "name": "Walk Arc Left",
+      "config": {
+        "type": "tool_walk_arc_left",
+        "profile": "default",
+        "serverName": "walk_arc_left"
+      },
+      "ui": {
+        "position": {
+          "x": 640,
+          "y": 480
+        },
+        "nodeType": "default",
+        "formDataValid": true
+      },
+      "control": [
+        {
+          "classType": "tool",
+          "from": "agent_strategist_1"
+        }
+      ]
+    },
+    {
+      "id": "walk_arc_right",
+      "provider": "tool_walk_arc_right",
+      "name": "Walk Arc Right",
+      "config": {
+        "type": "tool_walk_arc_right",
+        "profile": "default",
+        "serverName": "walk_arc_right"
+      },
+      "ui": {
+        "position": {
+          "x": 640,
+          "y": 550
+        },
+        "nodeType": "default",
+        "formDataValid": true
+      },
+      "control": [
+        {
+          "classType": "tool",
+          "from": "agent_strategist_1"
+        }
+      ]
+    },
+    {
+      "id": "look",
+      "provider": "tool_look",
+      "name": "Look",
+      "config": {
+        "type": "tool_look",
+        "profile": "default",
+        "serverName": "look"
+      },
+      "ui": {
+        "position": {
+          "x": 640,
+          "y": 620
+        },
+        "nodeType": "default",
+        "formDataValid": true
+      },
+      "control": [
+        {
+          "classType": "tool",
+          "from": "agent_strategist_1"
+        }
+      ]
+    },
+    {
+      "id": "kick",
+      "provider": "tool_kick",
+      "name": "Kick",
+      "config": {
+        "type": "tool_kick",
+        "profile": "default",
+        "serverName": "kick"
+      },
+      "ui": {
+        "position": {
+          "x": 640,
+          "y": 690
+        },
+        "nodeType": "default",
+        "formDataValid": true
+      },
+      "control": [
+        {
+          "classType": "tool",
+          "from": "agent_strategist_1"
+        }
+      ]
+    },
+    {
+      "id": "stop",
+      "provider": "tool_stop",
+      "name": "Stop",
+      "config": {
+        "type": "tool_stop",
+        "profile": "default",
+        "serverName": "stop"
+      },
+      "ui": {
+        "position": {
+          "x": 640,
+          "y": 760
+        },
+        "nodeType": "default",
+        "formDataValid": true
+      },
+      "control": [
+        {
+          "classType": "tool",
+          "from": "agent_strategist_1"
+        }
+      ]
+    },
+    {
+      "id": "celebrate",
+      "provider": "tool_celebrate",
+      "name": "Celebrate",
+      "config": {
+        "type": "tool_celebrate",
+        "profile": "default",
+        "serverName": "celebrate"
+      },
+      "ui": {
+        "position": {
+          "x": 640,
+          "y": 830
+        },
+        "nodeType": "default",
+        "formDataValid": true
+      },
+      "control": [
+        {
+          "classType": "tool",
+          "from": "agent_strategist_1"
+        }
+      ]
+    },
+    {
+      "id": "response_answers_1",
+      "provider": "response_answers",
+      "name": "Plan JSON → Robot",
+      "config": {
+        "laneName": "answers"
+      },
+      "ui": {
+        "position": {
+          "x": 650,
+          "y": -50
+        },
+        "nodeType": "default",
+        "formDataValid": true
+      },
+      "input": [
+        {
+          "lane": "answers",
+          "from": "agent_strategist_1"
+        }
+      ]
+    }
+  ],
+  "project_id": "c2acec23-4d8b-4e13-a6ca-93a26cd403bc",
+  "version": 1,
+  "isLocked": false,
+  "snapToGrid": true,
+  "snapGridSize": [
+    10,
+    10
+  ],
+  "docRevision": 6
+}

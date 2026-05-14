@@ -1,0 +1,79 @@
+# ---- Webots controller build artifacts ----
+build/
+*.o
+*.d
+*.obj
+*.exe
+*.dll
+*.dylib
+*.so
+*.so.*
+*.a
+*.lib
+
+# Compiled controller binaries (named after their folder, no extension on macOS/Linux).
+# We list them explicitly so we don't accidentally ignore source files.
+controllers/soccer/soccer
+controllers/soccerv2/soccerv2
+controllers/soccerv3/soccerv3
+controllers/soccerv3/soccerv3_native*.so
+controllers/soccerv3/soccerv3_native*.pyd
+
+# Webots-generated/cached files
+*.wbproj
+*.bak
+controllers/soccerv3/strategy.pipe.bak
+*.cache
+
+# ---- Crash dumps / logs ----
+core
+core.*
+*.log
+
+# ---- macOS ----
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+Icon?
+.Spotlight-V100
+.Trashes
+
+# ---- Linux ----
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+
+# ---- Windows ----
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ---- IDE / editors ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-workspace
+*.sublime-project
+.clangd/
+.cache/
+compile_commands.json
+
+# ---- Python (in case pipelines o scripts auxiliares aparezcan) ----
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# ---- Env / secrets ----
+.env
+.env.*
+!.env.example

@@ -1,0 +1,23 @@
+pybind11>=2.11
+setuptools>=68
+wheel
+numpy>=1.26
+# rocketride: install from the local server build to stay in sync with the
+# server's wire protocol. From this folder:
+#   .venv/bin/pip install ../../../../rocketride-server/packages/client-python/dist/rocketride-1.0.0-py3-none-any.whl
+# (the 1.0.0 wheel actually ships as 1.0.6 on metadata; that's expected).
+# Falling back to PyPI works for older builds but may drift from your server.
+rocketride>=1.0
+# jmespath is a transitive dep used by the rocketride SDK at runtime but
+# not declared in its wheel metadata — keep it pinned here.
+jmespath>=1.0
+# aiohttp: webhook source listens on HTTP POST, the SDK only uses WebSocket
+# DAP — we need an HTTP client to actually deliver messages to the webhook.
+aiohttp>=3.10
+# mcp: expose robot actions as MCP tools so the RocketRide pipeline's
+# tool_mcp_client can invoke them via streamable-http transport.
+mcp>=1.0
+# Pillow: encode camera frames as JPEG so we can ship them inline to Claude
+# (the LLM is multimodal — letting it SEE the image is more reliable than
+# our HSV thresholds for finding the goal).
+Pillow>=10.0
